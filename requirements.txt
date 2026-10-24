@@ -1,0 +1,12 @@
+# Everything the server code imports directly, pinned to the versions it was tested with.
+mcp==2.3.0
+anyio==4.15.1
+pydantic==2.13.5
+PyJWT[crypto]==2.15.1
+cryptography==50.0.2
+starlette==1.7.0
+uvicorn==0.54.0
+# Postgres (the hosted database): the driver with its bundled libpq, and the connection pool.
+psycopg[binary,pool]==3.3.6
+psycopg-binary==3.3.6
+psycopg-pool==3.3.3

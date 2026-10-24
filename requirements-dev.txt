@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest==8.4.2
+# used directly by the tests (also installed with mcp; pinned here so test setup is explicit)
+httpx2==2.13.1
+# a throwaway local Postgres server for the Postgres tests (no admin rights needed; see tests/conftest.py)
+postgresql-binaries==18.6.0
