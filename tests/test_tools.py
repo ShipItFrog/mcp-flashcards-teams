@@ -1,11 +1,14 @@
 """Tool behaviour for a single user, including the abuse limits."""
 
+import inspect
+
 import pytest
-from helpers import error_text, mcp_client, payload, running_app
+from helpers import error_text, mcp_client, payload, refusal, running_app
 from mcp.server.mcpserver.exceptions import ToolError
 
+from flashcards_teams import limits
 from flashcards_teams.server import _text, _topic_filter
-from flashcards_teams.store import StoreFullError, StoreUnavailableError
+from flashcards_teams.store import CardStore, StoreFullError, StoreUnavailableError
 
 pytestmark = pytest.mark.anyio
 
@@ -107,6 +110,16 @@ def test_text_with_invalid_unicode_is_rejected():
         _text("bad \ud800 surrogate", "question", 500)
 
 
+async def test_a_full_deck_says_so(store, monkeypatch):
+    monkeypatch.setattr(limits, "MAX_CARDS_PER_TEAM", 1)
+    monkeypatch.setattr(limits, "MAX_CHARS_PER_TEAM", 5000)
+    async with running_app(store) as app, mcp_client(app, "alice-1", "auto") as alice:
+        payload(await alice.call_tool("add_card", CARD))
+        assert refusal(await alice.call_tool("add_card", CARD)) == (
+            "Deck is full (max 1 cards or 5,000 characters). Delete some cards first."
+        )
+
+
 async def test_rate_limit_is_per_user(store):
     async with running_app(store, rate_limit=(3, 60.0)) as app:
         async with mcp_client(app, "alice-1", "auto") as alice:
@@ -136,16 +149,22 @@ def test_a_topic_filter_with_invalid_unicode_is_rejected():
         _topic_filter("bad \ud800 surrogate")
 
 
+# Every async method of the CardStore protocol, so the fakes below can't fall behind it.
+STORE_METHODS = [name for name, member in vars(CardStore).items() if inspect.iscoroutinefunction(member)]
+
+
 class UnavailableStore:
     """A store whose database can't be reached."""
 
     async def _unavailable(self, *args, **kwargs):
         raise StoreUnavailableError
 
-    add = list = count = least_recently_reviewed = record_review = delete = _unavailable
-
     def close(self):
         pass
+
+
+for _name in STORE_METHODS:
+    setattr(UnavailableStore, _name, UnavailableStore._unavailable)
 
 
 async def test_a_database_outage_gets_a_message_the_user_can_act_on():
@@ -167,7 +186,9 @@ class FullStore(UnavailableStore):
     async def _full(self, *args, **kwargs):
         raise StoreFullError
 
-    add = list = count = least_recently_reviewed = record_review = delete = _full
+
+for _name in STORE_METHODS:
+    setattr(FullStore, _name, FullStore._full)
 
 
 async def test_a_full_database_is_not_reported_as_try_again_later():

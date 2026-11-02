@@ -11,6 +11,8 @@ from __future__ import annotations
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.mcpserver.exceptions import ToolError
 
+from . import limits
+
 
 def _normalize_issuer(issuer: str) -> str:
     # Used only for comparing and for the storage key, so that adding or removing a
@@ -35,3 +37,19 @@ def current_owner(issuer: str) -> str:
     if not isinstance(token_issuer, str) or _normalize_issuer(token_issuer) != _normalize_issuer(issuer):
         raise ToolError("Not signed in.")
     return f"{_normalize_issuer(issuer)}|{token.subject}"
+
+
+def clean_client_id(raw: str | None) -> str:
+    """The OAuth client's id as an audit record stores it: printable ASCII only (anything
+    else becomes "?"), at most limits.MAX_CLIENT_ID characters, "" when there is none.
+
+    It only hints at which app made a call. The client chooses it, so it is never
+    identity."""
+    text = "".join(c if " " <= c <= "~" else "?" for c in raw or "")
+    return text[: limits.MAX_CLIENT_ID]
+
+
+def current_client_id() -> str:
+    """The signed-in client's id, cleaned for the audit log (see clean_client_id)."""
+    token = get_access_token()
+    return clean_client_id(token.client_id if token is not None else None)

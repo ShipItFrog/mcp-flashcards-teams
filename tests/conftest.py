@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from helpers import empty_postgres_store
+from helpers import PgCluster, close_admin_connections, fresh_postgres_store
 
 from flashcards_teams.store import SqliteCardStore
 
@@ -56,7 +56,11 @@ def pg_url(tmp_path_factory):
         subprocess.run(
             [
                 pg_ctl, "-D", str(data), "-l", str(log), "-w", "-t", "60",
-                "-o", f"-p {port} -c listen_addresses=127.0.0.1 -c unix_socket_directories=", "start",
+                "-o",
+                # No durability for a throwaway server: every test rebuilds the tables.
+                f"-p {port} -c listen_addresses=127.0.0.1 -c unix_socket_directories="
+                " -c fsync=off -c synchronous_commit=off -c full_page_writes=off",
+                "start",
             ],
             check=True,
             stdin=subprocess.DEVNULL,
@@ -74,13 +78,39 @@ def pg_url(tmp_path_factory):
         subprocess.run([pg_ctl, "-D", str(data), "-m", "fast", "-w", "stop"], capture_output=True)
 
 
+@pytest.fixture(scope="session")
+def pg_cluster(pg_url):
+    """The test server set up like the hosted one: a database "ft" owned by a role
+    (ft_owner) that the server never connects as, and an app role (ft_app) that the
+    tests' stores connect as, with only the rights schema.setup_database grants. Trust
+    authentication, so neither URL holds a secret."""
+    import psycopg
+
+    with psycopg.connect(pg_url, autocommit=True) as conn:
+        conn.execute("CREATE ROLE ft_owner NOLOGIN")
+        conn.execute("CREATE ROLE ft_app LOGIN")
+        conn.execute("CREATE DATABASE ft OWNER ft_owner")
+    base = pg_url.rsplit("/", 1)[0].replace("postgresql://postgres@", "")
+    try:
+        yield PgCluster(admin_url=f"postgresql://postgres@{base}/ft", app_url=f"postgresql://ft_app@{base}/ft")
+    finally:
+        close_admin_connections()  # before the server stops
+
+
 @pytest.fixture(params=["sqlite", pytest.param("postgres", marks=pytest.mark.postgres)])
 def store(request, tmp_path):
-    """Every test that uses a store runs once on each database."""
+    """Every test that uses a store runs once on each database. The Postgres tables are
+    rebuilt for every test, so a mutation of the table definitions (applied when the
+    test starts) really reaches them."""
     if request.param == "sqlite":
         s = SqliteCardStore(tmp_path / "cards.db")
+        # No durability for a throwaway file, like the test Postgres server (fsync=off):
+        # on Windows every commit's file sync costs more than the test's own work.
+        s._conn.execute("PRAGMA synchronous = OFF")
+        s._conn.execute("PRAGMA journal_mode = MEMORY")
     else:
-        s = empty_postgres_store(request.getfixturevalue("pg_url"))
+        cluster = request.getfixturevalue("pg_cluster")
+        s = fresh_postgres_store(cluster.admin_url, cluster.app_url)
     yield s
     s.close()
 

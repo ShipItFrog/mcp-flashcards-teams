@@ -2,8 +2,13 @@
 real mistakes. Each one is applied with monkeypatch at test time (see conftest.py);
 the source files are never modified.
 
-Run all of them with:  python tests/run_mutations.py
+Run all of them with:  python tests/run_mutations.py  (add --fast to stop each run at
+its first failing test, for checks while working)
 Every mutation must make at least one test fail.
+
+Both stores share their SQL and their transaction logic (store._Ops), so most store
+mutations break both databases at once. The pg- ones break the Postgres store only
+(see _on_postgres): what they get wrong only shows with real concurrent connections.
 """
 
 from __future__ import annotations
@@ -18,11 +23,12 @@ from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
 
 from flashcards_teams import app as app_module
-from flashcards_teams import server
+from flashcards_teams import ids, limits, permissions, schema, server
 from flashcards_teams import store as store_module
 from flashcards_teams import verifier as verifier_module
 
 A = app_module
+P = permissions
 S = store_module
 V = verifier_module
 
@@ -53,40 +59,243 @@ def _no_issuer_check(issuer: str) -> str:
     return f"{issuer}|{token.subject}"
 
 
-def _record_review_unscoped(self, owner, card_no, correct):
-    """One query that forgot its owner filter."""
-    with self._lock, self._conn:
-        cur = self._conn.execute(
-            "UPDATE cards SET last_reviewed = ?, review_count = review_count + 1,"
-            " correct_count = correct_count + ?, wrong_count = wrong_count + ? WHERE card_no = ?",
-            (S._now(), 1 if correct else 0, 0 if correct else 1, card_no),
+# --- the store: shared SQL ---
+
+
+def _sql_variant(mp, name, old, new, *, module=S):
+    """Change one shared SQL constant (or, with ``module=schema``, a table definition).
+    The callers pass the parameters separately, so the placeholders must stay the same
+    in number and order: a condition is made always true, never removed."""
+    sql = getattr(module, name)
+    assert old in sql, (name, old)
+    assert old.count("?") == new.count("?"), (name, old, new)
+    mp.setattr(module, name, sql.replace(old, new))
+
+
+def _list_unpaginated(mp):
+    """Listing that ignores the page size and cursor. Dropping the LIMIT alone would
+    change nothing a user sees: the server fetches one card more than a page and cuts
+    the page itself."""
+    _sql_variant(mp, "_SQL_LIST", "LIMIT ?", "LIMIT ? + 1000000")
+    _sql_variant(mp, "_SQL_LIST", "card_no > ?", "(card_no > ? OR 1 = 1)")
+
+
+def _invite_stored_raw(mp):
+    """The server hands the store the invite code itself instead of its hash (and the
+    table takes a value of any length, so nothing else stops it)."""
+    mp.setattr(ids, "hash_invite", lambda code: code.strip())
+    for name in ("SQLITE_SCHEMA", "PG_TABLES"):
+        _sql_variant(mp, name, "CHECK (length(code_hash) = 64)", "CHECK (length(code_hash) > 0)", module=schema)
+
+
+# --- the store: permissions and the shared transaction logic (_Ops) ---
+
+
+def _required(**changes):
+    """The permission table with other minimum roles: tool=role."""
+
+    def change(mp):
+        for tool, role in changes.items():
+            mp.setitem(P.REQUIRED, tool, role)
+
+    return change
+
+
+def _default_allow(mp):
+    """allowed() lets through a tool the table doesn't name, and the table has lost remove_member."""
+
+    def allowed(role, tool):
+        need = P.REQUIRED.get(tool)
+        if need is None:
+            return True
+        return role in P.ROLE_RANK and P.ROLE_RANK[role] >= P.ROLE_RANK[need]
+
+    mp.setattr(P, "allowed", allowed)
+    mp.delitem(P.REQUIRED, "remove_member")
+
+
+def _role_cached(mp):
+    """Remembers a member's row, role and all, the first time it is read (one cache for
+    the whole process, as a module-level dict would be)."""
+    original = S._Ops._member
+    cache = {}
+
+    def _member(self, q, team_id, principal):
+        key = (team_id, principal)
+        if key not in cache:
+            row = original(self, q, team_id, principal)
+            if row is None:
+                return None  # only members are remembered
+            cache[key] = row
+        return cache[key]
+
+    mp.setattr(S._Ops, "_member", _member)
+
+
+def _nonmember_distinguishable(mp):
+    """Tells a team the caller isn't in apart from one that doesn't exist: "permission denied"."""
+    exists = "SELECT 1 AS found FROM teams WHERE team_id = ?"
+    guarded, readable = S._Ops._guarded, S._Ops._readable_team
+
+    def _guarded(self, tool, actor, team_id, target, action):
+        outcome = guarded(self, tool, actor, team_id, target, action)
+        if outcome.kind == "not_member" and team_id is not None:
+            with self.x.tx(read_only=True) as q:
+                if S._one(q(exists, (team_id,))) is not None:
+                    return S.Outcome("denied", tool)
+        return outcome
+
+    def _readable_team(self, q, actor, team_id, tool):
+        found = readable(self, q, actor, team_id, tool)
+        if isinstance(found, S.Outcome) and found.kind == "not_member" and S._one(q(exists, (team_id,))) is not None:
+            return S.Outcome("denied", tool)
+        return found
+
+    mp.setattr(S._Ops, "_guarded", _guarded)
+    mp.setattr(S._Ops, "_readable_team", _readable_team)
+
+
+def _last_owner_unchecked(tools):
+    """Lets ``tools`` take a team's last owner away; the other tools still check."""
+
+    def change(mp):
+        original = S._Ops._is_last_owner
+        mp.setattr(S._Ops, "_is_last_owner", lambda self, c, role: False if c.tool in tools else original(self, c, role))
+
+    return change
+
+
+def _on_postgres(mp, name, patched):
+    """Replace ``_Ops.<name>`` for the Postgres store only; the SQLite store keeps the
+    real one."""
+    original = getattr(S._Ops, name)
+
+    def method(self, *args, **kwargs):
+        return (patched if isinstance(self.x, S.PostgresCardStore) else original)(self, *args, **kwargs)
+
+    mp.setattr(S._Ops, name, method)
+
+
+def _personal_team_looked_for_once(self, q, actor, tool):
+    """_Ops._personal_team that looks for the caller's personal team only before taking
+    the site lock, not again once it holds it."""
+    row = S._one(q(S._SQL_PERSONAL, (actor.principal,)))
+    if row is not None:
+        return row["team_id"]
+    if tool != "add_card":
+        return S.Outcome("failed", reason="no_card", logged=False)
+    self.x.lock_site(q)
+    return self._create_personal_team(q, actor)
+
+
+def _personal_team_duplicated(mp):
+    """The personal team is looked for once, then inserted without ON CONFLICT: two first
+    adds at once both insert."""
+    _on_postgres(mp, "_personal_team", _personal_team_looked_for_once)
+    _sql_variant(mp, "_SQL_INSERT_PERSONAL", " ON CONFLICT (personal_of) DO NOTHING", "")
+
+
+def _refusal_needs_audit_room(mp):
+    """A refusal the audit log has no room for stops the call as a change would: the
+    caller is told the log is full instead of the real reason, and it isn't counted."""
+    original = S._Ops._next_seq
+
+    def _next_seq(self, q, team_id, tool, *, ok):
+        seq = original(self, q, team_id, tool, ok=ok)
+        if seq is None and not ok:
+            raise S.AuditFullError("nearly")
+        return seq
+
+    mp.setattr(S._Ops, "_next_seq", _next_seq)
+
+
+def _no_owner_reserve(mp):
+    """The last part of the audit allowance is kept for nobody: once only it is left,
+    owners can't change roles or remove members, and members can't leave."""
+    original = S._Ops._next_seq
+
+    def _next_seq(self, q, team_id, tool, *, ok):
+        return original(self, q, team_id, tool, ok=False)
+
+    mp.setattr(S._Ops, "_next_seq", _next_seq)
+
+
+def _pg_guarded(*, cards_counted_before_lock=False, role_from_before_lock=False, unlocked=()):
+    """A Postgres _Ops._guarded with one mistake about its lock: the deck's card count
+    taken before the team's row is locked, the permission judged on the role read
+    before the lock, or ``unlocked`` tools that don't lock the row at all."""
+
+    def _guarded(self, tool, actor, team_id, target, action):
+        x = self.x
+        with x.tx(read_only=False) as q:
+            if team_id is None:
+                found = self._personal_team(q, actor, tool)
+                if isinstance(found, S.Outcome):
+                    return found
+                team_id = found
+            before = self._member(q, team_id, actor.principal)
+            if before is None:
+                return S.Outcome("not_member")
+            full = False
+            if cards_counted_before_lock and tool == "add_card":
+                full = S._one(q(S._SQL_USAGE, (team_id,)))["cards"] >= limits.MAX_CARDS_PER_TEAM
+            suffix = "" if tool in unlocked else x.lock_team_suffix
+            team = S._one(q(S._SQL_LOCK_TEAM + suffix, (team_id,)))
+            member = before if role_from_before_lock else self._member(q, team_id, actor.principal)
+            if team is None or member is None:
+                return S.Outcome("not_member")
+            c = S._Call(q, tool, actor, team_id, target or f"member:{member['member_no']}", team, member)
+            if not P.allowed(member["role"], tool):
+                return self._refuse(c, "denied", "role", tool)
+            if full:
+                return self._refuse(c, "failed", "deck_full")
+            return action(c)
+
+    return _guarded
+
+
+def _pg_add(*, max_numbering=False, limit_before_lock=False, number_in_own_transaction=False):
+    """A Postgres add with one ordering or transaction mistake."""
+
+    def _add_card(self, c, question, answer, topic, card_no=None):
+        usage = S._one(c.q(S._SQL_USAGE, (c.team_id,)))
+        too_many = usage["cards"] >= limits.MAX_CARDS_PER_TEAM and not limit_before_lock  # counted before the lock
+        if too_many or usage["chars"] + len(question) + len(answer) + len(topic) > limits.MAX_CHARS_PER_TEAM:
+            return self._refuse(c, "failed", "deck_full")
+        seq = self._alloc_seq(c.q, c.team_id, c.tool)
+        if card_no is None:
+            card_no = c.team["next_card_no"]
+            c.q(S._SQL_NEXT_CARD_NO, (c.team_id,))
+        if max_numbering:
+            card_no = S._one(c.q("SELECT COALESCE(MAX(card_no), 0) + 1 AS n FROM cards WHERE team_id = ?", (c.team_id,)))["n"]
+        row = S._one(
+            c.q(S._SQL_INSERT_CARD, (c.team_id, card_no, question, answer, topic, S.topic_key(topic), self._now()))
         )
-        if cur.rowcount == 0:
-            return None
-        row = self._conn.execute(f"SELECT {S._CARD_COLUMNS} FROM cards WHERE card_no = ?", (card_no,)).fetchone()
-    return S._row_to_card(row)
+        self._insert_audit(c, seq, "ok", target=f"card:{card_no}")
+        return S.Outcome("ok", S._row_to_card(row))
 
+    def add(self, actor, team_id, question, answer, topic):
+        # Committed at once, whatever happens next: the personal team too, if this made it.
+        with self.x.tx(read_only=False) as q:
+            found = self._personal_team(q, actor, "add_card") if team_id is None else team_id
+            if isinstance(found, S.Outcome):
+                return found
+            taken = S._one(
+                q("UPDATE teams SET next_card_no = next_card_no + 1 WHERE team_id = ? RETURNING next_card_no - 1 AS n", (found,))
+            )
+        card_no = taken["n"] if taken is not None else None
+        return self._guarded(
+            "add_card", actor, team_id, "team", lambda c: _add_card(self, c, question, answer, topic, card_no)
+        )
 
-def _least_recent_ignores_time(self, owner, topic):
-    """Review order that only looks at 'reviewed or not', not when."""
-    clause, params = S._topic_clause(topic)
-    with self._lock:
-        row = self._conn.execute(
-            f"SELECT {S._CARD_COLUMNS} FROM cards WHERE owner = ?{clause}"
-            " ORDER BY last_reviewed IS NOT NULL, card_no LIMIT 1",
-            [owner, *params],
-        ).fetchone()
-    return S._row_to_card(row) if row else None
+    def change(mp):
+        _on_postgres(mp, "_add_card", _add_card)
+        if limit_before_lock:
+            _on_postgres(mp, "_guarded", _pg_guarded(cards_counted_before_lock=True))
+        if number_in_own_transaction:
+            _on_postgres(mp, "add", add)
 
-
-def _list_unpaginated(self, owner, topic, limit, after_id):
-    """Listing that ignores the page size and cursor."""
-    clause, params = S._topic_clause(topic)
-    with self._lock:
-        rows = self._conn.execute(
-            f"SELECT {S._CARD_COLUMNS} FROM cards WHERE owner = ?{clause} ORDER BY card_no", [owner, *params]
-        ).fetchall()
-    return [S._row_to_card(r) for r in rows]
+    return change
 
 
 def _auth_without_audience_check(**kwargs):
@@ -541,72 +750,6 @@ def _challenge_without_scope(mp):
     mp.setattr(A.McpEndpointGuard, "__init__", patched)
 
 
-_PG_NUMBER = (
-    "INSERT INTO owners (owner, next_no) VALUES (%s, 2)"
-    " ON CONFLICT (owner) DO UPDATE SET next_no = owners.next_no + 1 RETURNING next_no - 1 AS card_no"
-)
-
-
-def _pg_add(*, max_numbering=False, limit_before_lock=False, number_in_own_transaction=False):
-    """A Postgres add with one ordering or transaction mistake."""
-
-    def check_limits(conn, owner, question, answer, topic):
-        usage = conn.execute(
-            "SELECT COUNT(*) AS cards, COALESCE(SUM(length(question) + length(answer) + length(topic)), 0) AS chars"
-            " FROM cards WHERE owner = %s",
-            (owner,),
-        ).fetchone()
-        if usage["cards"] >= S.MAX_CARDS_PER_OWNER or usage["chars"] + len(question) + len(answer) + len(topic) > S.MAX_CHARS_PER_OWNER:
-            raise S.CardLimitError
-
-    def _add(self, owner, question, answer, topic):
-        if number_in_own_transaction:
-            with self._connection() as conn:  # committed at once, whatever happens next
-                card_no = conn.execute(_PG_NUMBER, (owner,)).fetchone()["card_no"]
-        with self._connection() as conn:
-            if limit_before_lock:
-                check_limits(conn, owner, question, answer, topic)
-            if not number_in_own_transaction:
-                card_no = conn.execute(_PG_NUMBER, (owner,)).fetchone()["card_no"]
-            if max_numbering:
-                card_no = conn.execute(
-                    "SELECT COALESCE(MAX(card_no), 0) + 1 AS n FROM cards WHERE owner = %s", (owner,)
-                ).fetchone()["n"]
-            if not limit_before_lock:
-                check_limits(conn, owner, question, answer, topic)
-            row = conn.execute(
-                "INSERT INTO cards (owner, card_no, question, answer, topic, topic_key, created_at)"
-                f" VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING {S._CARD_COLUMNS}",
-                (owner, card_no, question, answer, topic, S.topic_key(topic), S._now()),
-            ).fetchone()
-        return S._row_to_card(row)
-
-    return _add
-
-
-def _pg_review_nulls_last(self, owner, topic):
-    """Orders by review time alone: Postgres puts never-reviewed cards (NULL) last."""
-    clause, params = S._topic_clause(topic, "%s")
-    with self._connection() as conn:
-        row = conn.execute(
-            f"SELECT {S._CARD_COLUMNS} FROM cards WHERE owner = %s{clause} ORDER BY last_reviewed, card_no LIMIT 1",
-            [owner, *params],
-        ).fetchone()
-    return S._row_to_card(row) if row else None
-
-
-def _pg_record_review_unscoped(self, owner, card_no, correct):
-    """One Postgres query that forgot its owner filter."""
-    with self._connection() as conn:
-        row = conn.execute(
-            "UPDATE cards SET last_reviewed = %s, review_count = review_count + 1,"
-            " correct_count = correct_count + %s, wrong_count = wrong_count + %s"
-            f" WHERE card_no = %s RETURNING {S._CARD_COLUMNS}",
-            (S._now(), 1 if correct else 0, 0 if correct else 1, card_no),
-        ).fetchone()
-    return S._row_to_card(row) if row else None
-
-
 def _pg_request_errors_unmapped(mp):
     """Requests hand the driver's own error on instead of StoreUnavailableError
     (startup still maps its errors)."""
@@ -623,8 +766,8 @@ def _pg_prepared_statements(mp):
     """Leaves psycopg's server-side prepared statements on, which Neon's pooler may break."""
     original = S.PostgresCardStore.__init__
 
-    def init(self, url):
-        original(self, url)
+    def init(self, url, **kw):
+        original(self, url, **kw)
         self._pool.kwargs.pop("prepare_threshold", None)
 
     mp.setattr(S.PostgresCardStore, "__init__", init)
@@ -632,7 +775,7 @@ def _pg_prepared_statements(mp):
 
 def _pg_full_as_unavailable(mp):
     """Reports a full database as a passing outage ("try again in a minute")."""
-    original = S.PostgresCardStore._mapped_errors
+    original = S.PostgresCardStore.map_errors
 
     @contextmanager
     def mapped(self):
@@ -642,7 +785,7 @@ def _pg_full_as_unavailable(mp):
         except S.StoreFullError:
             raise S.StoreUnavailableError from None
 
-    mp.setattr(S.PostgresCardStore, "_mapped_errors", mapped)
+    mp.setattr(S.PostgresCardStore, "map_errors", mapped)
 
 
 def _pg_no_connection_check(mp):
@@ -704,10 +847,16 @@ MUTATIONS = {
     "key-by-client-id": lambda mp: mp.setattr(server, "current_owner", _key_by_client_id),
     "no-subject-check": lambda mp: mp.setattr(server, "current_owner", _no_subject_check),
     "no-issuer-check": lambda mp: mp.setattr(server, "current_owner", _no_issuer_check),
-    "unscoped-grade": lambda mp: mp.setattr(S.SqliteCardStore, "_record_review", _record_review_unscoped),
+    # One query that forgot its team filter (both databases: the SQL is shared).
+    "unscoped-grade": lambda mp: _sql_variant(mp, "_SQL_GRADE", "team_id = ?", "(team_id = ? OR 1 = 1)"),
+    # Was pg-unscoped-grade, before the two stores shared their SQL.
+    "unscoped-delete": lambda mp: _sql_variant(mp, "_SQL_DELETE", "team_id = ?", "(team_id = ? OR 1 = 1)"),
     "no-audience-check": lambda mp: mp.setattr(server, "AuthSettings", _auth_without_audience_check),
-    "review-ignores-time": lambda mp: mp.setattr(S.SqliteCardStore, "_least_recently_reviewed", _least_recent_ignores_time),
-    "unpaginated-list": lambda mp: mp.setattr(S.SqliteCardStore, "_list", _list_unpaginated),
+    # Review order by card number alone, not by when each card was last reviewed.
+    "review-ignores-time": lambda mp: _sql_variant(
+        mp, "_SQL_REVIEW", "ORDER BY last_reviewed IS NOT NULL, last_reviewed, card_no", "ORDER BY card_no"
+    ),
+    "unpaginated-list": _list_unpaginated,
     "topic-not-normalized": lambda mp: mp.setattr(S, "topic_key", lambda topic: topic),
     "no-rate-limit": lambda mp: mp.setattr(server.RateLimiter, "check", lambda self, key: None),
     "jwt-signature-not-checked": lambda mp: mp.setattr(V.JwtTokenVerifier, "_decode", _decode_without_signature),
@@ -785,14 +934,50 @@ MUTATIONS = {
     "text-nul-allowed": lambda mp: mp.setattr(server, "_check_characters", _characters_unchecked),
     "outage-unexplained": lambda mp: mp.setattr(server, "_stored", _outage_unexplained),
     # Postgres only: run_mutations.py skips these when no local Postgres is available.
-    "pg-number-from-max": lambda mp: mp.setattr(S.PostgresCardStore, "_add", _pg_add(max_numbering=True)),
-    "pg-limit-checked-before-lock": lambda mp: mp.setattr(S.PostgresCardStore, "_add", _pg_add(limit_before_lock=True)),
-    "pg-number-in-own-transaction": lambda mp: mp.setattr(S.PostgresCardStore, "_add", _pg_add(number_in_own_transaction=True)),
-    "pg-review-nulls-last": lambda mp: mp.setattr(S.PostgresCardStore, "_least_recently_reviewed", _pg_review_nulls_last),
-    "pg-unscoped-grade": lambda mp: mp.setattr(S.PostgresCardStore, "_record_review", _pg_record_review_unscoped),
+    "pg-number-from-max": _pg_add(max_numbering=True),
+    "pg-limit-checked-before-lock": _pg_add(limit_before_lock=True),
+    "pg-number-in-own-transaction": _pg_add(number_in_own_transaction=True),
+    # Orders by review time alone: Postgres puts never-reviewed cards (NULL) last, SQLite first.
+    "pg-review-nulls-last": lambda mp: _sql_variant(
+        mp, "_SQL_REVIEW", "ORDER BY last_reviewed IS NOT NULL, last_reviewed", "ORDER BY last_reviewed"
+    ),
     "pg-no-connection-check": _pg_no_connection_check,
     "pg-request-errors-unmapped": _pg_request_errors_unmapped,
     "pg-prepared-statements": _pg_prepared_statements,
     "pg-full-as-unavailable": _pg_full_as_unavailable,
     "app-origins-not-standardized": lambda mp: mp.setattr(A, "_standard_origin", lambda origin: origin),
+    # --- Teams, roles and invites (module 3, step 2). ---
+    "perm-viewer-can-delete": _required(delete_card="viewer"),
+    "perm-viewer-can-grade": _required(grade_card="viewer"),
+    "perm-default-allow": _default_allow,
+    "perm-members-by-editor": _required(set_member_role="editor", remove_member="editor"),
+    # Membership in any team counts as membership in this one.
+    "perm-any-team": lambda mp: _sql_variant(
+        mp, "_SQL_MEMBER", "team_id = ? AND principal = ?", "(team_id = ? OR 1 = 1) AND principal = ?"
+    ),
+    "perm-role-cached": _role_cached,
+    "pg-perm-checked-before-lock": lambda mp: _on_postgres(mp, "_guarded", _pg_guarded(role_from_before_lock=True)),
+    # Everyone who joins becomes an editor, whatever the invite says.
+    "join-role-not-from-invite": lambda mp: _sql_variant(
+        mp, "_SQL_INVITE", "SELECT invite_no, role FROM", "SELECT invite_no, 'editor' AS role FROM"
+    ),
+    # A removed member stays in the team, as a viewer.
+    "remove-keeps-row": lambda mp: _sql_variant(mp, "_SQL_REMOVE", "DELETE FROM members", "UPDATE members SET role = 'viewer'"),
+    "nonmember-distinguishable": _nonmember_distinguishable,
+    "pg-personal-team-duplicated": _personal_team_duplicated,
+    # A first add that waited behind another one counts the personal team that one made
+    # as a team too many: at the server's last free place it is told the server is full.
+    "pg-personal-team-not-rechecked": lambda mp: _on_postgres(mp, "_personal_team", _personal_team_looked_for_once),
+    "invite-reusable": lambda mp: _sql_variant(mp, "_SQL_INVITE", "used_at IS NULL", "(used_at IS NULL OR 1 = 1)"),
+    "invite-never-expires": lambda mp: _sql_variant(mp, "_SQL_INVITE", "expires_at > ?", "(expires_at > ? OR 1 = 1)"),
+    "invite-stored-raw": _invite_stored_raw,
+    "last-owner-unchecked": _last_owner_unchecked({"set_member_role", "remove_member"}),
+    "leave-last-owner-unchecked": _last_owner_unchecked({"leave_team"}),
+    "pg-last-owner-without-lock": lambda mp: _on_postgres(
+        mp, "_guarded", _pg_guarded(unlocked=("set_member_role", "remove_member"))
+    ),
+    # Counts no shared teams, so MAX_SHARED_TEAMS_PER_PERSON never stops anyone.
+    "team-cap-unchecked": lambda mp: _sql_variant(mp, "_SQL_COUNT_SHARED", "SELECT COUNT(*) AS n", "SELECT 0 * COUNT(*) AS n"),
+    "refusal-needs-audit-room": _refusal_needs_audit_room,
+    "no-owner-reserve": _no_owner_reserve,
 }

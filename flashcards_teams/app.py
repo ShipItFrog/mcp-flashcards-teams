@@ -419,7 +419,9 @@ class McpEndpointGuard:
 
 
 def open_store(settings: Settings) -> CardStore:
-    """Open the configured database, creating its tables if needed, and say which one."""
+    """Open the configured database and say which one. A SQLite file gets its tables
+    created if needed; a Postgres database must already have them (the server never
+    creates tables there: see schema.setup_database)."""
     if settings.database_url is not None:
         label = database_label(settings.database_url)
         logger.info("Connecting to the Postgres database %s", label)
@@ -430,14 +432,7 @@ def open_store(settings: Settings) -> CardStore:
                 f"Could not reach the Postgres database {label} at startup. "
                 "Check FLASHCARDS_DATABASE_URL (value not shown) and that the database is running."
             ) from None
-        if store.created_tables:
-            logger.warning(
-                "Created the card tables in the Postgres database %s, which had none. If you expected "
-                "existing cards, check FLASHCARDS_DATABASE_URL.",
-                label,
-            )
-        else:
-            logger.info("Opened the existing card tables in the Postgres database %s", label)
+        logger.info("Connected to the Postgres database %s", label)
         return store
     assert settings.db_path is not None
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)

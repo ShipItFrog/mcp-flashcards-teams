@@ -1,7 +1,7 @@
 [project]
 name = "mcp-flashcards-teams"
 version = "0.1.0"
-description = "Hosted flashcards MCP server for teams, with OAuth sign-in, per-team roles and an append-only audit log."
+description = "Hosted flashcards MCP server for teams, with OAuth sign-in and per-team roles (work in progress: the append-only audit log isn't finished)."
 requires-python = ">=3.12"
 dependencies = ["mcp==2.3.0", "PyJWT[crypto]==2.15.1", "psycopg[binary,pool]==3.3.6", "psycopg-pool==3.3.3"]
 

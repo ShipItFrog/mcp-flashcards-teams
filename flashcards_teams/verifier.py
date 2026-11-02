@@ -10,7 +10,7 @@ provider. A token is accepted only if:
 - its audience (`aud`) includes this server's URL, so a token the same provider
   issued for some other server is refused (RFC 8707);
 - it has not expired (`exp` is required) and is not dated in the future;
-- it names a user (`sub`), which identity.py uses as the data owner, and has no
+- it names a user (`sub`), which identity.py uses as the user's identity, and has no
   `dsub` claim (Descope's sign that a token template replaced `sub`);
 - if it names its kind (`token_type`), that is `access_token`, so a token that
   says it is a refresh or ID token can't stand in for one. Descope's access tokens
@@ -299,7 +299,7 @@ class JwtTokenVerifier(TokenVerifier):
             return None
         if "dsub" in claims:
             # Descope moves the user ID to `dsub` when a token template overrides `sub`;
-            # `sub` may then no longer identify the user, and it is the data owner here.
+            # `sub` may then no longer identify the user, and it is the user's identity here.
             logger.warning(
                 "Rejected an access token with a 'dsub' claim: its 'sub' may not be the user's ID. "
                 "Turn off 'override subject claim' in the token template this server's tokens use."

@@ -8,7 +8,10 @@ With a local Postgres available (see tests/conftest.py), every run must also run
 Postgres tests: FLASHCARDS_REQUIRE_PG=1 turns a skip into a failure. Without one, the
 pg- variants can't be checked; they are reported as not run, and the run fails.
 
-Usage:  python tests/run_mutations.py
+Usage:  python tests/run_mutations.py [--fast]
+
+--fast runs pytest with -x, so a caught variant stops at its first failing test. For
+checks while working only: the run recorded in TEST-LOG.md is always the full one.
 """
 
 from __future__ import annotations
@@ -30,7 +33,7 @@ POSTGRES = bool(os.environ.get("FLASHCARDS_TEST_PG_BIN") or importlib.util.find_
 RUN_TIMEOUT_SECONDS = 600
 
 
-def run(mutation: str | None) -> tuple[int, str, list[str]]:
+def run(mutation: str | None, *, fast: bool = False) -> tuple[int, str, list[str]]:
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     env.pop("FLASHCARDS_MUTATION", None)
     if POSTGRES:
@@ -39,7 +42,7 @@ def run(mutation: str | None) -> tuple[int, str, list[str]]:
         env["FLASHCARDS_MUTATION"] = mutation
     try:
         r = subprocess.run(
-            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rf"],
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rf", *(["-x"] if fast else [])],
             cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=RUN_TIMEOUT_SECONDS,
         )
@@ -51,7 +54,13 @@ def run(mutation: str | None) -> tuple[int, str, list[str]]:
     return r.returncode, summary, failed
 
 
-def main() -> int:
+def main(argv: list[str]) -> int:
+    unknown = [arg for arg in argv if arg != "--fast"]
+    if unknown:
+        print(f"unknown arguments: {unknown}")
+        print("usage: python tests/run_mutations.py [--fast]")
+        return 2
+    fast = "--fast" in argv
     code, summary, _ = run(None)
     print(f"baseline (real code): {summary}")
     if code != 0:
@@ -63,7 +72,7 @@ def main() -> int:
             print(f"\n{name}: NOT RUN (no local Postgres)")
             not_run.append(name)
             continue
-        code, summary, failed = run(name)
+        code, summary, failed = run(name, fast=fast)
         if code == -1:
             status = "INVALID (hung)"
         elif "error" in summary:
@@ -87,4 +96,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
