@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 from helpers import actor, mcp_client, payload, raw, refusal, rows, running_app, snapshot, team_fixture
 
-from flashcards_teams import schema
+from flashcards_teams import limits, schema
 from flashcards_teams import store as store_module
 from flashcards_teams.server import M_INVITE, M_NO_TEAM
 from flashcards_teams.store import Outcome, SqliteCardStore
@@ -146,8 +146,10 @@ def test_shared_sql_has_no_percent_sign():
 
 
 # What would take back an audit record: deleting, changing, emptying or overwriting one.
+# "BEFORE TRUNCATE" is the trigger that refuses it.
 TAKES_BACK = re.compile(
-    r"\bDELETE\s+FROM\s+audit_events\b|\bUPDATE\s+audit_events\b|\bTRUNCATE\b|\bINSERT\s+OR\s+REPLACE\b|\bREPLACE\s+INTO\b",
+    r"\bDELETE\s+FROM\s+audit_events\b|\bUPDATE\s+audit_events\b|(?<!BEFORE )\bTRUNCATE\b|\bINSERT\s+OR\s+REPLACE\b"
+    r"|\bREPLACE\s+INTO\b",
     re.IGNORECASE,
 )
 # A team's audit counters, wherever a statement sets one.
@@ -156,8 +158,8 @@ COUNTER_SET = re.compile(r"\b(next_audit_seq|audit_writes|audit_reads)\s*=\s*(.+
 
 def test_no_statement_takes_back_an_audit_record():
     # In the code, records are only ever added and a team's audit counters only go up, so
-    # a place in its allowance, once used, never comes back. (Step 3 adds the triggers and
-    # database rights that enforce this; this checks the statements the code can run.)
+    # a place in its allowance, once used, never comes back. (The triggers and database
+    # rights enforce this too; this checks the statements the code can run.)
     statements = [value for name, value in vars(store_module).items() if name.startswith("_SQL_")]
     statements += [schema.SQLITE_SCHEMA, schema.PG_TABLES, schema.PG_AUDIT, *schema._PG_GRANTS]
     counters = []
@@ -183,11 +185,24 @@ def structure(store) -> list[tuple]:
     ) + raw(store, "SELECT tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = 'public' ORDER BY 1, 2")
 
 
+def test_cards_have_only_their_primary_key_index(store):
+    # No (team_id, topic_key) index: churning cards with ever new topics would leave pages in
+    # it that VACUUM can't reclaim. Every query on cards picks a team first.
+    if isinstance(store, SqliteCardStore):
+        indexes = raw(store, "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'cards'")
+        assert indexes == [("sqlite_autoindex_cards_1", None)]  # the one SQLite makes for the primary key
+    else:
+        indexes = raw(store, "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND tablename = 'cards'")
+        assert indexes == [("cards_pkey",)]
+
+
 def counts(store) -> dict[str, int]:
     return {table: rows(store, table) for table in TABLES}
 
 
-async def test_hostile_text_through_the_tools_changes_nothing_it_shouldnt(store):
+async def test_hostile_text_through_the_tools_changes_nothing_it_shouldnt(store, monkeypatch):
+    # dave creates a team for each injection, besides team A: above the real limit.
+    monkeypatch.setattr(limits, "MAX_SHARED_TEAMS_PER_PERSON", 1 + len(INJECTIONS))
     f = await team_fixture(store)
     shape = structure(store)
     async with running_app(store) as app, mcp_client(app, "dave-1", "auto") as dave:

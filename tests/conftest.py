@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from helpers import PgCluster, close_admin_connections, fresh_postgres_store
+from helpers import PgCluster, close_admin_connections, fresh_postgres_store, scratch_database
 
 from flashcards_teams.store import SqliteCardStore
 
@@ -95,6 +95,14 @@ def pg_cluster(pg_url):
         yield PgCluster(admin_url=f"postgresql://postgres@{base}/ft", app_url=f"postgresql://ft_app@{base}/ft")
     finally:
         close_admin_connections()  # before the server stops
+
+
+@pytest.fixture
+def scratch_db(pg_url, pg_cluster):
+    """A database of the test's own, not set up yet, with an app role of its own (see
+    helpers.scratch_database). pg_cluster made the ft_owner role it is owned by."""
+    with scratch_database(pg_url) as db:
+        yield db
 
 
 @pytest.fixture(params=["sqlite", pytest.param("postgres", marks=pytest.mark.postgres)])

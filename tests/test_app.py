@@ -13,10 +13,11 @@ import httpx2
 import jwt
 import pytest
 import uvicorn
-from helpers import HEADERS, INITIALIZE
+from helpers import HEADERS, INITIALIZE, as_superuser, set_up_as_owner
 from jwt_helpers import DROP, JWKS, JsonServer, sign
 
-from flashcards_teams.app import ConfigError, build_app, check_provider, load_settings, server_options
+from flashcards_teams import schema
+from flashcards_teams.app import ConfigError, build_app, check_provider, load_settings, open_store, server_options
 
 pytestmark = pytest.mark.anyio
 
@@ -463,6 +464,43 @@ def test_a_single_quote_in_the_database_password_is_fine(tmp_path):
     settings = load_settings(env(tmp_path, FLASHCARDS_DB=None, FLASHCARDS_DATABASE_URL=url))
     assert settings.database_url == url
     assert SENTINEL not in repr(settings)
+
+
+# --- starting on Postgres: the schema and role check ---
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("render", [True, False], ids=["render", "local"])
+@pytest.mark.parametrize("problem", ["not-set-up", "too-powerful"])
+def test_the_server_wont_start_on_a_database_it_must_not_use(tmp_path, scratch_db, render, problem):
+    if problem == "too-powerful":
+        set_up_as_owner(scratch_db.admin_url, scratch_db.role)
+        as_superuser(scratch_db.admin_url, f"GRANT UPDATE ON audit_events TO {scratch_db.role}")
+    settings = load_settings(
+        env(tmp_path, FLASHCARDS_DB=None, FLASHCARDS_DATABASE_URL=scratch_db.url, RENDER="true" if render else None)
+    )
+    assert settings.on_render is render
+    with pytest.raises(ConfigError) as stopped:
+        open_store(settings)
+    # The fixed message, which names no URL, host or role.
+    assert str(stopped.value) == {"not-set-up": schema.NOT_READY, "too-powerful": schema.TOO_POWERFUL}[problem]
+
+
+@pytest.mark.postgres
+def test_startup_names_the_postgres_database_but_never_its_url(tmp_path, scratch_db, caplog):
+    set_up_as_owner(scratch_db.admin_url, scratch_db.role)
+    # The local server trusts every connection, so it accepts this password without needing it.
+    url = scratch_db.url.replace("@", f":{SENTINEL}@", 1)
+    settings = load_settings(env(tmp_path, FLASHCARDS_DB=None, FLASHCARDS_DATABASE_URL=url))
+    with caplog.at_level(logging.INFO):
+        open_store(settings).close()
+    label = f"{scratch_db.name!r} on '127.0.0.1'"
+    assert [r.getMessage() for r in caplog.records if r.name == "flashcards_teams.app"] == [
+        f"Connecting to the Postgres database {label}",
+        f"Database schema checked: the Postgres database {label}",
+    ]
+    for text in (SENTINEL, url, scratch_db.url, scratch_db.role):
+        assert text not in caplog.text
 
 
 @pytest.mark.parametrize(

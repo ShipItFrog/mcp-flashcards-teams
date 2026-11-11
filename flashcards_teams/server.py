@@ -29,7 +29,7 @@ from pydantic import Field
 
 from . import ids, limits, permissions
 from .identity import current_client_id, current_owner
-from .store import Actor, AuditFullError, CardStore, Outcome, StoreFullError, StoreUnavailableError
+from .store import Actor, AuditFullError, CardStore, Outcome, StoreFullError, StoreRefusedError, StoreUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +84,11 @@ M_AUDIT_READS_FULL = (
 )
 M_SERVER_FULL = "This server has reached its limit of teams. Please let the server's owner know."
 M_REFUSED = "The card database refused the change. Please let the server's owner know."
+M_DAILY_LIMIT = (
+    "You have made {n} changes in this team today (UTC), the most one member can make in a day. "
+    "Try again after midnight UTC."
+)
+M_INVITES_USED_UP = "This team has created all {n} invite codes it can, so it can't invite anyone else."
 
 INSTRUCTIONS = (
     "Flashcard decks for you and your teams. Without team_id, tools use your personal deck. In a team, viewers "
@@ -134,6 +139,8 @@ async def _stored(call):
         raise ToolError("The card database is temporarily unavailable. Please try again in a minute.") from None
     except StoreFullError:
         raise ToolError("The card database is out of space. Please let the server's owner know.") from None
+    except StoreRefusedError:  # the store has logged what kind of refusal, and nothing more
+        raise ToolError(M_REFUSED) from None
 
 
 async def _outcome(tool: str, call) -> Outcome:
@@ -175,6 +182,8 @@ def _result(outcome: Outcome, tool: str, **ctx: Any) -> Any:
         "personal_team": lambda: M_PERSONAL_LEAVE if tool == "leave_team" else M_PERSONAL,
         "already_member": lambda: M_ALREADY.format(member_no=outcome.value),
         "too_many_teams": lambda: M_TOO_MANY_TEAMS.format(n=limits.MAX_SHARED_TEAMS_PER_PERSON),
+        "daily_limit": lambda: M_DAILY_LIMIT.format(n=limits.MAX_WRITES_PER_MEMBER_PER_DAY),
+        "invites_used_up": lambda: M_INVITES_USED_UP.format(n=limits.MAX_INVITES_PER_TEAM),
     }
     raise ToolError(messages[reason]())
 
@@ -393,11 +402,15 @@ def create_server(
         the next page, call again with after_seq set to next_after_seq."""
         actor = caller()
         _check_team_id(team_id, "read_audit_log")
+        # Fetch one extra record only to learn whether another page exists.
         page = _result(
             await _outcome("read_audit_log", store.read_audit_log(actor, team_id, limit + 1, after_seq)),
             "read_audit_log",
         )
-        return {"ok": True, **page}
+        events = page["events"]
+        has_more = len(events) > limit
+        events = events[:limit]
+        return {"ok": True, "events": events, "next_after_seq": events[-1]["seq"] if has_more else None}
 
     @mcp.tool()
     async def leave_team(team_id: TeamId) -> dict[str, Any]:

@@ -8,8 +8,9 @@ one that doesn't exist.
 
 Every write to an existing team goes through ``_Ops._guarded``, one transaction in a
 fixed order: find the team, check membership without a lock, lock the team's row, read
-the member again, check the permission, check the request, allocate an audit number,
-act, record the audit row, commit. Creating a team, joining one, and the first add_card
+the member again, check the permission, check the member's daily limit, check the
+request, allocate an audit number, act, record the audit row, count the change toward
+the daily limit, commit. Creating a team, joining one, and the first add_card
 (which creates the caller's personal team) take their locks themselves, always in the
 order person, site, team row. Refusals and failures are returned as an ``Outcome``
 rather than raised, so their audit rows commit too (a refusal the audit log has no room
@@ -57,6 +58,19 @@ POOL_OPEN_SECONDS = 30.0
 CONNECT_TIMEOUT_SECONDS = 10
 # Longest a write waits for its team's row lock before giving up ("temporarily unavailable").
 LOCK_WAIT_SECONDS = 10
+# Longest a transaction may sit idle, and one statement may run, before Postgres ends it
+# ("temporarily unavailable"). A stuck transaction holds back VACUUM, so every write
+# meanwhile leaves an old row version behind; this way none lives past half a minute.
+PG_IDLE_IN_TRANSACTION_TIMEOUT = "30s"
+PG_STATEMENT_TIMEOUT = "30s"
+# The search path for every transaction. Postgres' default starts with "$user", so a
+# schema named after the app role, if one existed and the role could create tables in
+# it, would take the place of the server's tables for every unqualified name. pg_temp is
+# listed last because, unlisted, a session's temporary schema is searched first for table
+# names: through a transaction-mode pooler (Neon's -pooler URLs) backends are shared, so a
+# temporary table named audit_events (or teams) left in one by anyone holding the app
+# role's credentials would take the place of the server's table, diverting or hiding records.
+PG_SEARCH_PATH = "public, pg_temp"
 # Shown in Postgres' own views (pg_stat_activity), so this server's connections can be told apart.
 APPLICATION_NAME = "mcp-flashcards-teams"
 
@@ -89,6 +103,12 @@ class StoreUnavailableError(Exception):
 
 class StoreFullError(Exception):
     """The database is out of space or over a resource limit: retrying won't help."""
+
+
+class StoreRefusedError(Exception):
+    """The database refused a change: a constraint, an append-only trigger or a missing
+    right. Nothing of the call was kept. Raised instead of the driver's own error, whose
+    text may quote the row (card content included)."""
 
 
 class AuditFullError(Exception):
@@ -166,7 +186,9 @@ _SQL_INSERT_PERSONAL = (
     " ON CONFLICT (personal_of) DO NOTHING RETURNING team_id"
 )
 _SQL_INSERT_TEAM = "INSERT INTO teams (team_id, name, created_at, next_member_no) VALUES (?, ?, ?, 2)"
-_SQL_MEMBER = "SELECT member_no, role, refused_count FROM members WHERE team_id = ? AND principal = ?"
+_SQL_MEMBER = (
+    "SELECT member_no, role, refused_count, writes_day, writes_today FROM members WHERE team_id = ? AND principal = ?"
+)
 # The Postgres store appends " FOR UPDATE": every write to a team queues on this row.
 _SQL_LOCK_TEAM = (
     "SELECT name, personal_of, next_card_no, next_member_no, next_invite_no, next_audit_seq, audit_writes, audit_reads"
@@ -187,6 +209,12 @@ _SQL_SET_ROLE = "UPDATE members SET role = ? WHERE team_id = ? AND member_no = ?
 _SQL_REMOVE = "DELETE FROM members WHERE team_id = ? AND member_no = ?"
 _SQL_LEAVE = "DELETE FROM members WHERE team_id = ? AND member_no = ?"
 _SQL_COUNT_REFUSAL = "UPDATE members SET refused_count = refused_count + 1 WHERE team_id = ? AND member_no = ?"
+# One more change today, or the first of a new UTC day. Both sides of SET read the row as
+# it was before this UPDATE, in both databases.
+_SQL_COUNT_WRITE = (
+    "UPDATE members SET writes_today = CASE WHEN writes_day = ? THEN writes_today + 1 ELSE 1 END, writes_day = ?"
+    " WHERE team_id = ? AND member_no = ?"
+)
 _SQL_MY_TEAMS = (
     "SELECT t.team_id, t.name, t.personal_of IS NOT NULL AS personal, m.role, m.member_no, t.audit_writes, t.audit_reads"
     " FROM members m JOIN teams t ON t.team_id = m.team_id WHERE m.principal = ?"
@@ -251,6 +279,7 @@ _SQL_ALLOC_READ_SEQ = (
 )
 _SQL_AUDIT_WRITES = "SELECT audit_writes FROM teams WHERE team_id = ?"
 _SQL_INSERT_AUDIT = f"INSERT INTO audit_events (team_id, {_AUDIT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+_SQL_AUDIT_PAGE = f"SELECT {_AUDIT_COLUMNS} FROM audit_events WHERE team_id = ? AND seq > ? ORDER BY seq LIMIT ?"
 
 
 def _row_to_card(row: Any) -> dict[str, Any]:
@@ -327,7 +356,27 @@ class _Ops:
             # The permission comes before any check that could tell what exists.
             if not permissions.allowed(member["role"], tool):
                 return self._refuse(c, "denied", "role", tool)
-            return action(c)
+            capped = tool in permissions.DAILY_CAPPED_TOOLS
+            # So does the daily limit. The member row was read under the lock, so calls at
+            # the same time can't pass it together.
+            if capped and self._daily_limit_reached(c):
+                return self._refuse(c, "failed", "daily_limit")
+            outcome = action(c)
+            if capped and outcome.kind == "ok":
+                today = self._today()
+                q(_SQL_COUNT_WRITE, (today, today, team_id, member["member_no"]))
+            return outcome
+
+    def _today(self) -> str:
+        """Today's UTC date, which the daily limit counts by."""
+        return self.x._clock().astimezone(timezone.utc).date().isoformat()
+
+    def _daily_limit_reached(self, c: _Call) -> bool:
+        """Whether the caller has made all the changes one member may make in this team today."""
+        return (
+            c.member["writes_day"] == self._today()
+            and c.member["writes_today"] >= limits.MAX_WRITES_PER_MEMBER_PER_DAY
+        )
 
     def _personal_team(self, q: Callable[..., Any], actor: Actor, tool: str) -> str | Outcome:
         """The caller's personal team. Only add_card creates it; grading or deleting
@@ -557,6 +606,9 @@ class _Ops:
     def _create_invite(self, c: _Call, role: str, code_hash: str) -> Outcome:
         if c.team["personal_of"] is not None:
             return self._refuse(c, "failed", "personal_team")
+        # next_invite_no is the next number to hand out, so one less have been made.
+        if c.team["next_invite_no"] > limits.MAX_INVITES_PER_TEAM:
+            return self._refuse(c, "failed", "invites_used_up")
         seq = self._alloc_seq(c.q, c.team_id, c.tool)
         invite_no = c.team["next_invite_no"]
         c.q(_SQL_NEXT_INVITE_NO, (c.team_id,))
@@ -655,11 +707,31 @@ class _Ops:
         )
 
     def _read_audit_log(self, c: _Call, limit_plus_one: int, after_seq: int) -> Outcome:
-        # The permission checks only, so far: no page is read and no audit.read row written yet.
-        return Outcome("ok", {"events": [], "next_after_seq": None})
+        """A page of the team's audit log after ``after_seq``, oldest first. Every read is
+        itself recorded (in the next page, not this one), and reads have an allowance of
+        their own: a read it has no room for reads nothing."""
+        seq = self._alloc_read_seq(c.q, c.team_id)
+        events = [dict(row) for row in c.q(_SQL_AUDIT_PAGE, (c.team_id, after_seq, limit_plus_one)).fetchall()]
+        self._insert_audit(c, seq, "ok")
+        return Outcome("ok", {"events": events})
+
+    def _alloc_read_seq(self, q: Callable[..., Any], team_id: str) -> int:
+        """The next audit number for a successful read of the log, from the reads'
+        allowance. Raises AuditFullError("reads"), which rolls the call back."""
+        row = _one(q(_SQL_ALLOC_READ_SEQ, (team_id, limits.AUDIT_READS_CAP_PER_TEAM)))
+        if row is None:
+            raise AuditFullError("reads")
+        return row["next_audit_seq"] - 1
 
 
 # --- the two stores -------------------------------------------------------------
+
+
+def _refused(e: Exception) -> None:
+    """Raise StoreRefusedError for the database's refusal ``e``. Only its class and
+    SQLSTATE are logged: the message may quote the whole row, card content included."""
+    logger.error("The card database refused a change: %s %s", type(e).__name__, getattr(e, "sqlstate", ""))
+    raise StoreRefusedError from None
 
 
 class _ThreadedStore:
@@ -737,7 +809,10 @@ class SqliteCardStore(_ThreadedStore):
 
     @contextmanager
     def map_errors(self):
-        yield
+        try:
+            yield
+        except sqlite3.IntegrityError as e:  # a constraint or an append-only trigger
+            _refused(e)
 
     @contextmanager
     def tx(self, read_only: bool):
@@ -772,12 +847,18 @@ class PostgresCardStore(_ThreadedStore):
         from psycopg.rows import dict_row
         from psycopg_pool import ConnectionPool
 
-        self._unavailable = psycopg.OperationalError  # also covers the pool's PoolTimeout
+        # OperationalError also covers the pool's PoolTimeout and a statement Postgres cancels
+        # after PG_STATEMENT_TIMEOUT. A transaction it ends for idling past
+        # PG_IDLE_IN_TRANSACTION_TIMEOUT comes as SQLSTATE 25P03, which psycopg files under
+        # InternalError; retrying works for it too.
+        self._unavailable = (psycopg.OperationalError, psycopg.errors.IdleInTransactionSessionTimeout)
+        # A constraint, an append-only trigger (RAISE EXCEPTION), or a right the app role lacks.
+        self._refusals = (psycopg.IntegrityError, psycopg.errors.RaiseException, psycopg.errors.InsufficientPrivilege)
         self._clock = clock
         self._ops = _Ops(self)
-        # Not checked yet: verify_schema will check the tables and this role's rights when
-        # the store opens, once schema.verify_app_role exists. Tests pass False, so that a
-        # broken table will still fail a test rather than the setup of every test.
+        # verify_schema checks the tables and this role's rights once the pool is open
+        # (schema.verify_app_role). Tests pass False, so that a broken table will still
+        # fail a test rather than the setup of every test.
         self._verify_schema = verify_schema
         self._pool = ConnectionPool(
             url,
@@ -806,6 +887,9 @@ class PostgresCardStore(_ThreadedStore):
         try:
             with self.map_errors():
                 self._pool.open(wait=True, timeout=POOL_OPEN_SECONDS)
+            if verify_schema:
+                with self._connection() as conn:
+                    schema.verify_app_role(conn)
         except BaseException:
             self._pool.close()
             raise
@@ -818,6 +902,8 @@ class PostgresCardStore(_ThreadedStore):
         # libpq never puts the password in a message; the host and user name may be there.
         try:
             yield
+        except self._refusals as e:
+            _refused(e)
         except self._unavailable as e:
             # Disk full (SQLSTATE 53100, which Neon's storage limit is expected to raise)
             # won't pass by retrying, unlike the rest of the class: too many connections,
@@ -837,12 +923,26 @@ class PostgresCardStore(_ThreadedStore):
     @contextmanager
     def tx(self, read_only: bool):
         with self._connection() as conn:
+            # set_config(..., true) lasts only for this transaction, so it also works through
+            # Neon's transaction-mode pooler and never reaches another call.
             if read_only:
-                # One snapshot for the whole call: the membership check, a page and its total agree.
+                # One snapshot for the whole call: the membership check, a page and its total
+                # agree. This must be the transaction's first statement.
                 conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                conn.execute(
+                    "SELECT set_config('search_path', %s, true),"
+                    " set_config('idle_in_transaction_session_timeout', %s, true),"
+                    " set_config('statement_timeout', %s, true)",
+                    (PG_SEARCH_PATH, PG_IDLE_IN_TRANSACTION_TIMEOUT, PG_STATEMENT_TIMEOUT),
+                )
             else:
-                # SET LOCAL lasts only for this transaction, so it also works through Neon's pooler.
-                conn.execute(f"SET LOCAL lock_timeout = '{LOCK_WAIT_SECONDS}s'")
+                conn.execute(
+                    "SELECT set_config('search_path', %s, true),"
+                    " set_config('lock_timeout', %s, true),"
+                    " set_config('idle_in_transaction_session_timeout', %s, true),"
+                    " set_config('statement_timeout', %s, true)",
+                    (PG_SEARCH_PATH, f"{LOCK_WAIT_SECONDS}s", PG_IDLE_IN_TRANSACTION_TIMEOUT, PG_STATEMENT_TIMEOUT),
+                )
             yield lambda sql, params=(): conn.execute(sql.replace("?", "%s"), params)
 
     def lock_person(self, q: Callable[..., Any], principal: str) -> None:

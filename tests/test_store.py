@@ -204,7 +204,13 @@ async def test_roles_decide_and_are_read_on_every_call(store):
     assert (await store.add(erin, f.team, "q", "a", "t")).kind == "denied"
     await card(store.set_member_role(dave, f.team, f.numbers["erin"], "editor"))
     await card(store.add(erin, f.team, "q", "a", "t"))
-    assert await card(store.read_audit_log(dave, f.team, 101, 0)) == {"events": [], "next_after_seq": None}
+    # The owner reads every record of the team, in order, the last one erin's new card.
+    [(recorded,)] = raw(store, "SELECT COUNT(*) FROM audit_events WHERE team_id = ?", (f.team,))
+    events = (await card(store.read_audit_log(dave, f.team, 101, 0)))["events"]
+    assert [e["seq"] for e in events] == list(range(1, recorded + 1))
+    assert {k: events[-1][k] for k in ("member_no", "action", "result")} == {
+        "member_no": f.numbers["erin"], "action": "card.add", "result": "ok",
+    }
 
 
 async def test_members_and_owners(store):

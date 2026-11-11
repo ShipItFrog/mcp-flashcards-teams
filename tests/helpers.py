@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from collections.abc import Callable, Coroutine
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
@@ -67,6 +68,11 @@ TOKENS = {
     "other-issuer": _token("other-issuer", "alice", issuer="https://other-idp.example.test"),
     # The team tests' people, each with a client_id of their own.
     **{f"{name}-1": _token(f"{name}-1", name, client_id=f"client-{name}") for name in ("dave", "erin", "frank", "gina", "henry")},
+    # Client ids an audit record must clean up: control characters and far too long; just
+    # too long; none at all.
+    "weird-client-1": _token("weird-client-1", "weird", client_id="bad\nclient\x1b" + "x" * 500),
+    "long-client-1": _token("long-client-1", "long", client_id="".join(chr(ord("a") + i % 26) for i in range(100))),
+    "no-client-1": _token("no-client-1", "noclient", client_id=""),
 }
 
 
@@ -100,12 +106,13 @@ async def running_app(
     stateless: bool = False,
     rate_limit: tuple[int, float] | None = None,
     token_verifier: TokenVerifier | None = None,
+    issuer: str = ISSUER,
 ):
     extra = {} if rate_limit is None else {"rate_limit": rate_limit}
     mcp = create_server(
         store=store,
         token_verifier=token_verifier or FakeVerifier(),
-        issuer_url=ISSUER,
+        issuer_url=issuer,
         resource_url=RESOURCE,
         required_scopes=[SCOPE],
         **extra,
@@ -178,6 +185,55 @@ def close_admin_connections() -> None:
         _ADMIN_CONNECTIONS.popitem()[1].close()
 
 
+@contextmanager
+def scratch_database(pg_url: str):
+    """A new, empty database owned by ft_owner, and a new login role to connect to it as,
+    both made for one test and removed after it. Roles and role memberships belong to the
+    whole server, not to a database, so a test that changes them uses a role of its own.
+
+    Yields ``name``, ``role``, ``admin_url`` (the superuser, on this database), ``url``
+    (the role, on this database) and ``extra_roles``, a list the test may add roles to
+    that are dropped too."""
+    import psycopg
+    from psycopg import sql
+
+    tag = uuid.uuid4().hex[:12]
+    name, role = f"ft_s_{tag}", f"ft_app_{tag}"
+    server = pg_url.rsplit("/", 1)[0].split("@", 1)[1]  # 127.0.0.1:port
+    admin = admin_connection(pg_url)
+    admin.execute(sql.SQL("CREATE DATABASE {} OWNER ft_owner").format(sql.Identifier(name)))
+    db = SimpleNamespace(
+        name=name, role=role, extra_roles=[],
+        admin_url=f"postgresql://postgres@{server}/{name}", url=f"postgresql://{role}@{server}/{name}",
+    )
+    try:
+        admin.execute(sql.SQL("CREATE ROLE {} LOGIN").format(sql.Identifier(role)))
+        yield db
+    finally:
+        # The database first: the rights granted in it go with it, so the roles can go.
+        admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name)))
+        for r in (role, *db.extra_roles):
+            admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(r)))
+
+
+def as_superuser(admin_url: str, *statements: str) -> None:
+    """Run statements on a scratch database as the superuser, each committed on its own."""
+    import psycopg
+
+    with psycopg.connect(admin_url, autocommit=True) as conn:
+        for statement in statements:
+            conn.execute(statement)
+
+
+def set_up_as_owner(admin_url: str, app_role: str) -> bool:
+    """schema.setup_database on a scratch database, run as its owner like the real setup."""
+    import psycopg
+
+    with psycopg.connect(admin_url, autocommit=True) as conn:
+        conn.execute("SET ROLE ft_owner")
+        return schema.setup_database(conn, app_role)
+
+
 def fresh_postgres_store(admin_url: str, app_url: str) -> PostgresCardStore:
     """A Postgres store on newly built, empty tables, connected as the app role.
 
@@ -248,6 +304,35 @@ def team_part(snap: dict[str, Any], team_id: str) -> dict[str, Any]:
         key: ({team_id: value[team_id]} if team_id in value else {}) if key == "audit" else [r for r in value if r[0] == team_id]
         for key, value in snap.items()
     }
+
+
+AUDIT_FIELDS = ("seq", "at", "member_no", "client_id", "action", "target", "result", "reason", "old_role", "new_role")
+
+
+def audit_rows(store, team_id: str) -> list[dict[str, Any]]:
+    """One team's audit records, oldest first, each as {column: value}."""
+    return [
+        dict(zip(AUDIT_FIELDS, row))
+        for row in raw(store, f"SELECT {', '.join(AUDIT_FIELDS)} FROM audit_events WHERE team_id = ? ORDER BY seq", (team_id,))
+    ]
+
+
+def audit_counters(store, team_id: str) -> tuple[int, int, int]:
+    """One team's (next_audit_seq, audit_writes, audit_reads)."""
+    [row] = raw(store, "SELECT next_audit_seq, audit_writes, audit_reads FROM teams WHERE team_id = ?", (team_id,))
+    return tuple(row)
+
+
+def assert_audit_counts_agree(store) -> None:
+    """The invariant behind the audit allowance, for every team: each record took the
+    next number and one place of the write or the read allowance, so
+    next_audit_seq - 1 = audit_writes + audit_reads = the team's records."""
+    with _reader(store) as run:
+        teams = run("SELECT team_id, next_audit_seq, audit_writes, audit_reads FROM teams")
+        recorded = dict(run("SELECT team_id, COUNT(*) FROM audit_events GROUP BY team_id"))
+    for team_id, next_seq, writes, reads in teams:
+        assert next_seq - 1 == writes + reads == recorded.get(team_id, 0), (team_id, next_seq, writes, reads, recorded)
+    assert set(recorded) <= {team_id for team_id, *_ in teams}  # no record of a team that doesn't exist
 
 
 async def team_fixture(store) -> SimpleNamespace:

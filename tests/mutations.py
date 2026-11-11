@@ -13,8 +13,10 @@ mutations break both databases at once. The pg- ones break the Postgres store on
 
 from __future__ import annotations
 
+import threading
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 
 import anyio
 import jwt
@@ -23,7 +25,7 @@ from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
 
 from flashcards_teams import app as app_module
-from flashcards_teams import ids, limits, permissions, schema, server
+from flashcards_teams import identity, ids, limits, permissions, schema, server, setup_db
 from flashcards_teams import store as store_module
 from flashcards_teams import verifier as verifier_module
 
@@ -220,36 +222,55 @@ def _no_owner_reserve(mp):
     mp.setattr(S._Ops, "_next_seq", _next_seq)
 
 
-def _pg_guarded(*, cards_counted_before_lock=False, role_from_before_lock=False, unlocked=()):
+# The team's audit count as a guarded write read it before locking the team's row (see
+# _audit_cap_outside_lock); None outside such a write. Each store call runs in one thread.
+_audit_writes_before_lock = threading.local()
+
+
+def _pg_guarded(*, cards_counted_before_lock=False, role_from_before_lock=False, unlocked=(), audit_counted_before_lock=False):
     """A Postgres _Ops._guarded with one mistake about its lock: the deck's card count
     taken before the team's row is locked, the permission judged on the role read
-    before the lock, or ``unlocked`` tools that don't lock the row at all."""
+    before the lock, ``unlocked`` tools that don't lock the row at all, or the team's
+    audit count read before the lock (for _audit_cap_outside_lock to judge by)."""
 
     def _guarded(self, tool, actor, team_id, target, action):
         x = self.x
-        with x.tx(read_only=False) as q:
-            if team_id is None:
-                found = self._personal_team(q, actor, tool)
-                if isinstance(found, S.Outcome):
-                    return found
-                team_id = found
-            before = self._member(q, team_id, actor.principal)
-            if before is None:
-                return S.Outcome("not_member")
-            full = False
-            if cards_counted_before_lock and tool == "add_card":
-                full = S._one(q(S._SQL_USAGE, (team_id,)))["cards"] >= limits.MAX_CARDS_PER_TEAM
-            suffix = "" if tool in unlocked else x.lock_team_suffix
-            team = S._one(q(S._SQL_LOCK_TEAM + suffix, (team_id,)))
-            member = before if role_from_before_lock else self._member(q, team_id, actor.principal)
-            if team is None or member is None:
-                return S.Outcome("not_member")
-            c = S._Call(q, tool, actor, team_id, target or f"member:{member['member_no']}", team, member)
-            if not P.allowed(member["role"], tool):
-                return self._refuse(c, "denied", "role", tool)
-            if full:
-                return self._refuse(c, "failed", "deck_full")
-            return action(c)
+        _audit_writes_before_lock.n = None
+        try:
+            with x.tx(read_only=False) as q:
+                if team_id is None:
+                    found = self._personal_team(q, actor, tool)
+                    if isinstance(found, S.Outcome):
+                        return found
+                    team_id = found
+                before = self._member(q, team_id, actor.principal)
+                if before is None:
+                    return S.Outcome("not_member")
+                full = False
+                if cards_counted_before_lock and tool == "add_card":
+                    full = S._one(q(S._SQL_USAGE, (team_id,)))["cards"] >= limits.MAX_CARDS_PER_TEAM
+                if audit_counted_before_lock:
+                    _audit_writes_before_lock.n = S._one(q(S._SQL_AUDIT_WRITES, (team_id,)))["audit_writes"]
+                suffix = "" if tool in unlocked else x.lock_team_suffix
+                team = S._one(q(S._SQL_LOCK_TEAM + suffix, (team_id,)))
+                member = before if role_from_before_lock else self._member(q, team_id, actor.principal)
+                if team is None or member is None:
+                    return S.Outcome("not_member")
+                c = S._Call(q, tool, actor, team_id, target or f"member:{member['member_no']}", team, member)
+                if not P.allowed(member["role"], tool):
+                    return self._refuse(c, "denied", "role", tool)
+                capped = tool in P.DAILY_CAPPED_TOOLS
+                if capped and self._daily_limit_reached(c):
+                    return self._refuse(c, "failed", "daily_limit")
+                if full:
+                    return self._refuse(c, "failed", "deck_full")
+                outcome = action(c)
+                if capped and outcome.kind == "ok":
+                    today = self._today()
+                    q(S._SQL_COUNT_WRITE, (today, today, team_id, member["member_no"]))
+                return outcome
+        finally:
+            _audit_writes_before_lock.n = None
 
     return _guarded
 
@@ -296,6 +317,624 @@ def _pg_add(*, max_numbering=False, limit_before_lock=False, number_in_own_trans
             _on_postgres(mp, "add", add)
 
     return change
+
+
+# --- module 3, step 3: the audit log and the limits ---
+
+
+def _audit_params(self, c, seq, result, reason="", *, target=None, old_role=None, new_role=None):
+    """The parameters _Ops._insert_audit gives _SQL_INSERT_AUDIT, for variants that write
+    a record somewhere else."""
+    return (
+        c.team_id, seq, self._now(), c.member["member_no"], c.actor.client_id,
+        P.AUDIT_ACTION[c.tool], target or c.target, result, reason, old_role, new_role,
+    )
+
+
+def _refuse_unrecorded(self, c, kind, reason, value=None):
+    """_Ops._refuse that counts the refusal but never records it."""
+    c.q(S._SQL_COUNT_REFUSAL, (c.team_id, c.member["member_no"]))
+    return S.Outcome(kind, value, reason)
+
+
+def _refuse_without_quota(self, c, kind, reason, value=None):
+    """_Ops._refuse that records every refusal while the audit log has room, however many
+    the member already has: refusals alone can fill the log."""
+    c.q(S._SQL_COUNT_REFUSAL, (c.team_id, c.member["member_no"]))
+    seq = self._next_seq(c.q, c.team_id, c.tool, ok=False)
+    if seq is None:
+        return S.Outcome(kind, value, reason, logged=False)
+    self._insert_audit(c, seq, kind, reason)
+    return S.Outcome(kind, value, reason)
+
+
+def _deck_full_recorded_as_ok(mp):
+    """A full deck is recorded as a success."""
+    original = S._Ops._insert_audit
+
+    def _insert_audit(self, c, seq, result, reason="", **kwargs):
+        if (result, reason) == ("failed", "deck_full"):
+            result, reason = "ok", ""
+        original(self, c, seq, result, reason, **kwargs)
+
+    mp.setattr(S._Ops, "_insert_audit", _insert_audit)
+
+
+def _audit_before_action_committed(mp):
+    """A guarded change's ok record is written as soon as its number is allocated, before
+    the change is made, and committed at once: on SQLite by committing the transaction so
+    far, on Postgres by another connection (audit_events has no foreign key, so that one
+    doesn't wait for the team's row). If the change then fails, its record stays."""
+    guarded, alloc, insert = S._Ops._guarded, S._Ops._alloc_seq, S._Ops._insert_audit
+    now = threading.local()  # the guarded call running in this thread, and whether its record is written
+
+    def _guarded(self, tool, actor, team_id, target, action):
+        def act(c):
+            now.c, now.written = c, False
+            return action(c)
+
+        try:
+            return guarded(self, tool, actor, team_id, target, act)
+        finally:
+            now.c = now.written = None
+
+    def _alloc_seq(self, q, team_id, tool):
+        seq = alloc(self, q, team_id, tool)
+        c = getattr(now, "c", None)
+        if c is not None:
+            params = _audit_params(self, c, seq, "ok")
+            if isinstance(self.x, S.PostgresCardStore):
+                with self.x._pool.connection() as other:
+                    other.execute(S._SQL_INSERT_AUDIT.replace("?", "%s"), params)
+            else:
+                q(S._SQL_INSERT_AUDIT, params)
+                self.x._conn.commit()
+            now.written = True
+        return seq
+
+    def _insert_audit(self, c, seq, result, reason="", **kwargs):
+        if result == "ok" and getattr(now, "written", None):
+            return  # written already
+        insert(self, c, seq, result, reason, **kwargs)
+
+    mp.setattr(S._Ops, "_guarded", _guarded)
+    mp.setattr(S._Ops, "_alloc_seq", _alloc_seq)
+    mp.setattr(S._Ops, "_insert_audit", _insert_audit)
+
+
+def _audit_after_commit_swallowed(mp):
+    """A guarded change commits first; its ok records are written afterwards in a
+    transaction of their own, and if that fails the change stays, unrecorded."""
+    guarded, insert = S._Ops._guarded, S._Ops._insert_audit
+    later = threading.local()
+
+    def _insert_audit(self, c, seq, result, reason="", **kwargs):
+        pending = getattr(later, "records", None)
+        if result == "ok" and pending is not None:
+            pending.append((c, seq, kwargs))
+        else:
+            insert(self, c, seq, result, reason, **kwargs)
+
+    def _guarded(self, tool, actor, team_id, target, action):
+        later.records = []
+        try:
+            outcome = guarded(self, tool, actor, team_id, target, action)
+            pending = later.records
+        finally:
+            later.records = None
+        for c, seq, kwargs in pending:
+            try:
+                with self.x.tx(read_only=False) as q:
+                    insert(self, replace(c, q=q), seq, "ok", **kwargs)
+            except Exception:
+                pass  # the change is made all the same
+        return outcome
+
+    mp.setattr(S._Ops, "_insert_audit", _insert_audit)
+    mp.setattr(S._Ops, "_guarded", _guarded)
+
+
+def _card_content_in_target(mp):
+    """A card's record names the card by its number and the start of its question."""
+    original = S._Ops._insert_audit
+
+    def _insert_audit(self, c, seq, result, reason="", *, target=None, **kwargs):
+        target = target or c.target
+        if result == "ok" and target.startswith("card:"):
+            card = S._one(c.q("SELECT question FROM cards WHERE team_id = ? AND card_no = ?", (c.team_id, int(target[5:]))))
+            if card is not None:
+                target = f"{target}:{card['question'][:20]}"
+        original(self, c, seq, result, reason, target=target, **kwargs)
+
+    mp.setattr(S._Ops, "_insert_audit", _insert_audit)
+
+
+def _read_unrecorded(self, c, limit_plus_one, after_seq):
+    """_Ops._read_audit_log that uses up a place of the reads' allowance but writes no
+    record of the read."""
+    self._alloc_read_seq(c.q, c.team_id)
+    events = [dict(row) for row in c.q(S._SQL_AUDIT_PAGE, (c.team_id, after_seq, limit_plus_one)).fetchall()]
+    return S.Outcome("ok", {"events": events})
+
+
+def _audit_cap_outside_lock(mp):
+    """Postgres: the audit allowance is judged on the count read before the team's row
+    was locked, and the place then taken whatever the count is by now. Writes queued on
+    the lock all see the last free place."""
+    original = S._Ops._next_seq
+
+    def _next_seq(self, q, team_id, tool, *, ok):
+        used = getattr(_audit_writes_before_lock, "n", None)
+        if used is None:  # not a guarded write, or a team made in this call: nothing read before a lock
+            return original(self, q, team_id, tool, ok=ok)
+        cap = limits.AUDIT_CAP_PER_TEAM
+        if not (ok and tool in P.RESERVE_TOOLS):
+            cap -= limits.AUDIT_OWNER_RESERVE
+        if used >= cap:
+            return None
+        row = S._one(q(
+            "UPDATE teams SET next_audit_seq = next_audit_seq + 1, audit_writes = audit_writes + 1"
+            " WHERE team_id = ? RETURNING next_audit_seq",
+            (team_id,),
+        ))
+        return row["next_audit_seq"] - 1
+
+    _on_postgres(mp, "_guarded", _pg_guarded(audit_counted_before_lock=True))
+    _on_postgres(mp, "_next_seq", _next_seq)
+
+
+def _sqlite_triggers_dropped(*names):
+    """SQLITE_SCHEMA without the named audit_events triggers."""
+
+    def change(mp):
+        for name in names:
+            sql = schema.SQLITE_SCHEMA
+            start = sql.index(f"CREATE TRIGGER IF NOT EXISTS {name} ")
+            end = sql.index("END;\n", start) + len("END;\n")
+            _sql_variant(mp, "SQLITE_SCHEMA", sql[start:end], "", module=schema)
+
+    return change
+
+
+def _pg_trigger_row_level_only(mp):
+    """Postgres: one per-row trigger for UPDATE and DELETE, and none for TRUNCATE. A
+    statement that matches no row fires nothing, and TRUNCATE fires no DELETE trigger."""
+    sql = schema.PG_AUDIT
+    start = sql.index("CREATE OR REPLACE TRIGGER audit_events_no_update_delete")
+    _sql_variant(
+        mp, "PG_AUDIT", sql[start:],
+        "CREATE OR REPLACE TRIGGER audit_events_no_update_delete\n"
+        "    BEFORE UPDATE OR DELETE ON audit_events\n"
+        "    FOR EACH ROW EXECUTE FUNCTION audit_events_refuse_change();\n",
+        module=schema,
+    )
+
+
+def _app_owns_tables(mp):
+    """Postgres: after setup, the superuser makes the app role the owner of every table,
+    so it may drop the triggers or grant itself anything."""
+    original = schema.setup_database
+
+    def setup_database(conn, app_role):
+        from psycopg import sql
+        from psycopg.rows import tuple_row
+
+        new = original(conn, app_role)
+        role = conn.cursor(row_factory=tuple_row).execute("SELECT current_user").fetchone()[0]
+        conn.execute("RESET ROLE")
+        try:
+            for table in ("schema_info", "teams", "members", "invites", "cards", "audit_events"):
+                conn.execute(sql.SQL("ALTER TABLE {} OWNER TO {}").format(sql.Identifier(table), sql.Identifier(app_role)))
+        finally:
+            conn.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(role)))
+        return new
+
+    mp.setattr(schema, "setup_database", setup_database)
+
+
+@contextmanager
+def _no_session_timeouts(self, read_only):
+    """PostgresCardStore.tx without the idle and statement timeouts: a stuck transaction
+    lives until someone ends it. The search path is still pinned."""
+    with self._connection() as conn:
+        if read_only:
+            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            conn.execute("SELECT set_config('search_path', %s, true)", (S.PG_SEARCH_PATH,))
+        else:
+            conn.execute(
+                "SELECT set_config('search_path', %s, true), set_config('lock_timeout', %s, true)",
+                (S.PG_SEARCH_PATH, f"{S.LOCK_WAIT_SECONDS}s"),
+            )
+        yield lambda sql, params=(): conn.execute(sql.replace("?", "%s"), params)
+
+
+def _idle_timeout_unmapped(mp):
+    """A transaction Postgres ends for idling (SQLSTATE 25P03, which psycopg files under
+    InternalError) escapes the store's error mapping instead of being reported as the
+    database being temporarily unavailable."""
+    import psycopg
+
+    original = S.PostgresCardStore.__init__
+
+    def __init__(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        self._unavailable = psycopg.OperationalError
+
+    mp.setattr(S.PostgresCardStore, "__init__", __init__)
+
+
+def _reserve_tools_daily_capped(mp):
+    """The daily limit stops member changes and leaving too, so an owner past it can't
+    remove a runaway member."""
+    original = S._Ops._guarded
+
+    def _guarded(self, tool, actor, team_id, target, action):
+        def act(c):
+            if c.tool in P.RESERVE_TOOLS and self._daily_limit_reached(c):
+                return self._refuse(c, "failed", "daily_limit")
+            return action(c)
+
+        return original(self, tool, actor, team_id, target, act)
+
+    mp.setattr(S._Ops, "_guarded", _guarded)
+
+
+def _create_invite(*, personal_checked=True, capped=True):
+    """_Ops._create_invite without its personal-team check or without its lifetime cap."""
+
+    def create(self, c, role, code_hash):
+        if personal_checked and c.team["personal_of"] is not None:
+            return self._refuse(c, "failed", "personal_team")
+        if capped and c.team["next_invite_no"] > limits.MAX_INVITES_PER_TEAM:
+            return self._refuse(c, "failed", "invites_used_up")
+        seq = self._alloc_seq(c.q, c.team_id, c.tool)
+        invite_no = c.team["next_invite_no"]
+        c.q(S._SQL_NEXT_INVITE_NO, (c.team_id,))
+        now = self.x._clock()
+        expires_at = int(now.timestamp()) + limits.INVITE_TTL_SECONDS
+        c.q(S._SQL_INSERT_INVITE, (c.team_id, invite_no, code_hash, role, c.member["member_no"], now.isoformat(), expires_at))
+        self._insert_audit(c, seq, "ok", target=f"invite:{invite_no}", new_role=role)
+        return S.Outcome("ok", {"invite_no": invite_no, "role": role, "expires_at": S._iso(expires_at)})
+
+    return create
+
+
+def _topic_index_restored(mp):
+    """The (team_id, topic_key) index on cards is back, in both databases."""
+    index = "CREATE INDEX IF NOT EXISTS cards_team_topic ON cards (team_id, topic_key);\n"
+    _sql_variant(mp, "SQLITE_SCHEMA", "CREATE TABLE IF NOT EXISTS audit_events", index + "CREATE TABLE IF NOT EXISTS audit_events", module=schema)
+    mp.setattr(schema, "PG_TABLES", schema.PG_TABLES + index)
+
+
+# --- module 3: restored variants of step 2 and 3 (cut on 2026-10-30) ---
+
+
+def _existence_before_permission(mp):
+    """grade_card and delete_card say a card doesn't exist before they say the caller may
+    not use them, so a viewer learns which card numbers exist."""
+    original = S._Ops._refuse
+
+    def _refuse(self, c, kind, reason, value=None):
+        if kind == "denied" and c.tool in ("grade_card", "delete_card"):
+            if S._one(c.q(S._SQL_CARD_EXISTS, (c.team_id, int(c.target.removeprefix("card:"))))) is None:
+                return original(self, c, "failed", "no_card")
+        return original(self, c, kind, reason, value)
+
+    mp.setattr(S._Ops, "_refuse", _refuse)
+
+
+def _reads_create_personal_team(mp):
+    """list_cards without a team creates the caller's personal team, as add_card does."""
+    original = S._Ops.list_page
+
+    def list_page(self, actor, team_id, *args):
+        if team_id is None:
+            with self.x.tx(read_only=False) as q:
+                self._personal_team(q, actor, "add_card")
+        return original(self, actor, team_id, *args)
+
+    mp.setattr(S._Ops, "list_page", list_page)
+
+
+def _expired_invite_distinguishable(mp):
+    """An expired invite is refused with a message of its own, so a code can be tested."""
+    original = S._Ops.join_team
+
+    def join_team(self, actor, code_hash):
+        outcome = original(self, actor, code_hash)
+        if outcome.reason == "invite_invalid":
+            with self.x.tx(read_only=True) as q:
+                row = S._one(q("SELECT expires_at FROM invites WHERE code_hash = ?", (code_hash,)))
+            if row is not None and row["expires_at"] <= int(self.x._clock().timestamp()):
+                raise server.ToolError("That invite code has expired.")
+        return outcome
+
+    mp.setattr(S._Ops, "join_team", join_team)
+
+
+def _invite_creator_not_rechecked(mp):
+    """An invite stays valid after its maker stops being an owner: still a member is enough."""
+    _sql_variant(mp, "_SQL_INVITE", " AND members.role = 'owner')", ")")
+
+
+def _invite_consumed_on_already_member(mp):
+    """A member who uses an invite again is refused, and the invite is used up anyway."""
+    original = S._Ops._refuse
+
+    def _refuse(self, c, kind, reason, value=None):
+        if reason == "already_member":
+            invite_no = int(c.target.removeprefix("invite:"))
+            c.q(S._SQL_USE_INVITE, (self._now(), c.member["member_no"], c.team_id, invite_no))
+        return original(self, c, kind, reason, value)
+
+    mp.setattr(S._Ops, "_refuse", _refuse)
+
+
+def _member_with_team_id_in_text(self, q, team_id, principal):
+    """_Ops._member with the team id written into the statement (one parameter fewer)."""
+    return S._one(q(
+        f"SELECT member_no, role, refused_count, writes_day, writes_today FROM members"
+        f" WHERE team_id = '{team_id}' AND principal = ?",
+        (principal,),
+    ))
+
+
+def _denied_raised_in_transaction(mp):
+    """A member's refusal is raised inside the transaction, which rolls its record back."""
+    original = S._Ops._refuse
+
+    def _refuse(self, c, kind, reason, value=None):
+        outcome = original(self, c, kind, reason, value)
+        if kind == "denied":
+            raise server.ToolError(server.M_DENIED.format(tool=c.tool, role=P.REQUIRED.get(c.tool, "owner")))
+        return outcome
+
+    mp.setattr(S._Ops, "_refuse", _refuse)
+
+
+def _nonmember_audited(mp):
+    """A stranger's attempt on a team that exists is recorded in it, as member 0."""
+    original = S._Ops._guarded
+
+    def _guarded(self, tool, actor, team_id, target, action):
+        outcome = original(self, tool, actor, team_id, target, action)
+        if outcome.kind == "not_member" and team_id is not None:
+            with self.x.tx(read_only=False) as q:
+                if S._one(q("SELECT 1 AS found FROM teams WHERE team_id = ?", (team_id,))) is not None:
+                    c = S._Call(q, tool, actor, team_id, target or "member:0", None, {"member_no": 0})
+                    seq = self._next_seq(q, team_id, tool, ok=False)
+                    if seq is not None:
+                        self._insert_audit(c, seq, "denied", "role")
+        return outcome
+
+    mp.setattr(S._Ops, "_guarded", _guarded)
+
+
+def _principal_as_client_id(mp):
+    """The record's client_id column holds who the caller is (issuer|sub), cut to fit."""
+    original = S._Ops._insert_audit
+
+    def _insert_audit(self, c, seq, result, reason="", **kwargs):
+        who = c.actor.principal
+        original(self, replace(c, actor=S.Actor(who, who[: limits.MAX_CLIENT_ID])), seq, result, reason, **kwargs)
+
+    mp.setattr(S._Ops, "_insert_audit", _insert_audit)
+
+
+def _refused_with_message(e):
+    """Logs the database's own message, which may quote the whole row."""
+    S.logger.error("The card database refused a change: %s %s", type(e).__name__, e)
+    raise S.StoreRefusedError from None
+
+
+def _outage_ok_rewritten(mp):
+    """Postgres: when the connection is lost before the commit, the change's ok records
+    are written again through a new connection, though the change itself is gone."""
+    insert, mapped = S._Ops._insert_audit, S.PostgresCardStore.map_errors
+    written = threading.local()  # this transaction's ok records
+
+    def _insert_audit(self, c, seq, result, reason="", **kwargs):
+        insert(self, c, seq, result, reason, **kwargs)
+        records = getattr(written, "records", None)
+        if result == "ok" and records is not None:
+            records.append(_audit_params(self, c, seq, result, reason, **kwargs))
+
+    @contextmanager
+    def map_errors(self):
+        written.records = []
+        try:
+            with mapped(self):
+                yield
+        except S.StoreUnavailableError:
+            records, written.records = written.records, None
+            with self._pool.connection() as conn:
+                for params in records or ():
+                    conn.execute(S._SQL_INSERT_AUDIT.replace("?", "%s"), params)
+            raise
+        finally:
+            written.records = None
+
+    mp.setattr(S._Ops, "_insert_audit", _insert_audit)
+    mp.setattr(S.PostgresCardStore, "map_errors", map_errors)
+
+
+# --- module 3, step 3: gaps found by the review (2026-11-07) ---
+
+
+def _triggers_not_always(mp):
+    """Postgres: setup leaves the triggers enabled the default way (ORIGIN), so they don't
+    fire in a replica session, and the startup check takes that as set up."""
+    sql = schema.PG_AUDIT
+    start = sql.index("ALTER TABLE audit_events ENABLE ALWAYS TRIGGER")
+    _sql_variant(mp, "PG_AUDIT", sql[start:], "", module=schema)
+    _sql_variant(mp, "_SQL_TRIGGERS", "t.tgenabled = 'A'", "t.tgenabled IN ('O', 'A')", module=schema)
+
+
+def _audit_page_off_by_one(mp):
+    """The server takes a full page for a sign of more (has_more = len(events) >= limit):
+    when exactly a page is left, it reports a next page, which is empty. Made in the store,
+    whose page then holds one record more for the server to cut, so the server's own code
+    stays as it is."""
+    original = S._Ops._read_audit_log
+
+    def _read_audit_log(self, c, limit_plus_one, after_seq):
+        outcome = original(self, c, limit_plus_one, after_seq)
+        events = outcome.value["events"]
+        if len(events) == limit_plus_one - 1:
+            events.append(events[-1])
+        return outcome
+
+    mp.setattr(S._Ops, "_read_audit_log", _read_audit_log)
+
+
+def _daily_limit_before_permission(mp):
+    """The day's limit is checked before the permission: a member at the limit who may not
+    use the tool at all is told the limit is reached, and it is recorded as such."""
+    original = S._Ops._refuse
+
+    def _refuse(self, c, kind, reason, value=None):
+        if (kind, reason) == ("denied", "role") and c.tool in P.DAILY_CAPPED_TOOLS and self._daily_limit_reached(c):
+            return original(self, c, "failed", "daily_limit")
+        return original(self, c, kind, reason, value)
+
+    mp.setattr(S._Ops, "_refuse", _refuse)
+
+
+def _card_checked_before_daily_limit(mp):
+    """grade_card and delete_card look the card up before the day's limit: a member at the
+    limit learns which card numbers don't exist."""
+    original = S._Ops._daily_limit_reached
+
+    def _daily_limit_reached(self, c):
+        if c.tool in ("grade_card", "delete_card"):
+            card_no = int(c.target.removeprefix("card:"))
+            if S._one(c.q(S._SQL_CARD_EXISTS, (c.team_id, card_no))) is None:
+                return False  # the action then says there is no such card
+        return original(self, c)
+
+    mp.setattr(S._Ops, "_daily_limit_reached", _daily_limit_reached)
+
+
+# --- module 3, step 3: gaps found by the second review (2026-11-07) ---
+
+
+def _trigger_names_only(mp):
+    """The startup check sees, for every trigger it knows by name, the definition it
+    expects, whatever the trigger really is: only the names are compared."""
+    expected = " ".join(f"WHEN '{name}' THEN '{definition}'" for name, definition in schema._PG_TRIGGERS.items())
+    _sql_variant(mp, "_SQL_TRIGGERS", "pg_get_triggerdef(t.oid)", f"CASE t.tgname {expected} END", module=schema)
+
+
+def _rules_and_row_security_ignored(mp):
+    """A rule on audit_events, or row security switched on, goes unseen."""
+    _sql_variant(mp, "_SQL_AUDIT_EXTRAS", "EXISTS (SELECT 1 FROM pg_rewrite r WHERE r.ev_class = c.oid)", "false", module=schema)
+    _sql_variant(mp, "_SQL_AUDIT_EXTRAS", "c.relrowsecurity", "false", module=schema)
+
+
+def _setup_unpinned(mp):
+    """setup_database as it was before the second review: the owner's session keeps
+    Postgres' default path, "$user" first, and the lock call names no schema and passes
+    the lock id as psycopg sends it (integer). An overload of pg_advisory_xact_lock(integer)
+    planted in a schema named after the owner runs with the owner's rights (one planted in
+    public runs too, but setup then refuses public's foreign objects and all of it is
+    rolled back)."""
+    _sql_variant(mp, "_SQL_SETUP_PIN", "pg_catalog.set_config('search_path', 'public, pg_temp', true)", "NULL", module=schema)
+    _sql_variant(mp, "_SQL_SETUP_LOCK", "pg_catalog.pg_advisory_xact_lock(%s::bigint)", "pg_advisory_xact_lock(%s)", module=schema)
+
+
+@contextmanager
+def _read_search_path_not_pinned(self, read_only):
+    """PostgresCardStore.tx whose read-only transactions keep the session's search path,
+    "$user" first: a schema named after the app role stands in for the tables in every
+    read. Writes are still pinned."""
+    with self._connection() as conn:
+        if read_only:
+            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            conn.execute(
+                "SELECT set_config('idle_in_transaction_session_timeout', %s, true),"
+                " set_config('statement_timeout', %s, true)",
+                (S.PG_IDLE_IN_TRANSACTION_TIMEOUT, S.PG_STATEMENT_TIMEOUT),
+            )
+        else:
+            conn.execute(
+                "SELECT set_config('search_path', %s, true),"
+                " set_config('lock_timeout', %s, true),"
+                " set_config('idle_in_transaction_session_timeout', %s, true),"
+                " set_config('statement_timeout', %s, true)",
+                (S.PG_SEARCH_PATH, f"{S.LOCK_WAIT_SECONDS}s", S.PG_IDLE_IN_TRANSACTION_TIMEOUT, S.PG_STATEMENT_TIMEOUT),
+            )
+        yield lambda sql, params=(): conn.execute(sql.replace("?", "%s"), params)
+
+
+# --- module 3, step 3: gaps found by the fourth review (2026-11-07) ---
+
+
+def _setup_foreign_variant(mp, old, new):
+    """Change setup's check for what it must not run into, both times setup runs it."""
+    for name in ("_SQL_SETUP_FOREIGN", "_SQL_SETUP_RECHECK"):
+        _sql_variant(mp, name, old, new, module=schema)
+
+
+def _setup_extension_exemption(alias):
+    """The part of setup's check that lets an extension's relation (alias r) or function
+    (alias f) through."""
+    return (
+        " AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend e JOIN pg_catalog.pg_extension x"
+        f" ON x.tableoid = e.refclassid AND x.oid = e.refobjid WHERE e.classid = {alias}.tableoid AND e.objid = {alias}.oid"
+        " AND e.deptype = 'e')"
+    )
+
+
+def _setup_refuses_extensions(mp):
+    """Setup counts what a trusted extension put in public as another role's objects (its
+    relations, its functions, and its functions a trigger calls), and refuses every
+    database with one, as on Neon."""
+    for alias in ("r", "f", "p"):
+        _setup_foreign_variant(mp, _setup_extension_exemption(alias), "")
+
+
+# The relation kinds setup's check skips: composite types and indexes.
+_SETUP_RELKIND_SKIP = " AND r.relkind NOT IN ('c', 'i', 'I')"
+
+
+def _setup_ignores_foreign_relations(mp):
+    """Setup's check looks at functions and triggers only: a table another role owns in
+    public goes unseen, whatever its rules or constraints call."""
+    relations = (
+        "EXISTS (SELECT 1 FROM pg_catalog.pg_class r WHERE r.relnamespace = n.oid AND r.relowner <> u.oid"
+        + _SETUP_RELKIND_SKIP + _setup_extension_exemption("r") + ")"
+    )
+    _setup_foreign_variant(mp, relations, "false")
+
+
+# The trigger part of setup's check: a trigger on a table in public but audit_events whose
+# function neither the role running setup nor an extension owns.
+_SETUP_TRIGGER_CHECK = (
+    " OR EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid"
+    " JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid"
+    " WHERE c.relnamespace = n.oid AND NOT t.tgisinternal AND c.relname <> 'audit_events' AND p.proowner <> u.oid"
+    + _setup_extension_exemption("p") + ")"
+)
+
+
+def _setup_refuses_owners_triggers(mp):
+    """Setup's trigger check as it was before the fourth review was verified: any trigger
+    on a table in public but audit_events is refused, even one that calls the owner's own
+    function on a table setup never writes to."""
+    _setup_foreign_variant(
+        mp,
+        _SETUP_TRIGGER_CHECK,
+        " OR EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid"
+        " WHERE c.relnamespace = n.oid AND NOT t.tgisinternal AND c.relname <> 'audit_events')",
+    )
+
+
+def _setup_leaves_app_create(mp):
+    """Setup no longer takes back CREATE on schema public and on the database from the app
+    role, so running it again doesn't undo that mistake."""
+    taken_back = ("REVOKE CREATE ON SCHEMA public FROM {app}", "REVOKE CREATE ON DATABASE {database} FROM {app}")
+    assert all(statement in schema._PG_GRANTS for statement in taken_back)
+    mp.setattr(schema, "_PG_GRANTS", tuple(s for s in schema._PG_GRANTS if s not in taken_back))
 
 
 def _auth_without_audience_check(**kwargs):
@@ -980,4 +1619,255 @@ MUTATIONS = {
     "team-cap-unchecked": lambda mp: _sql_variant(mp, "_SQL_COUNT_SHARED", "SELECT COUNT(*) AS n", "SELECT 0 * COUNT(*) AS n"),
     "refusal-needs-audit-room": _refusal_needs_audit_room,
     "no-owner-reserve": _no_owner_reserve,
+    # --- The audit log, its limits, and the database's own defences (module 3, step 3). ---
+    "audit-denied-not-recorded": lambda mp: mp.setattr(S._Ops, "_refuse", _refuse_unrecorded),
+    "audit-failed-as-ok": _deck_full_recorded_as_ok,
+    "audit-before-action-committed": _audit_before_action_committed,
+    "audit-after-commit-swallowed": _audit_after_commit_swallowed,
+    "audit-records-card-content": _card_content_in_target,
+    "audit-read-not-recorded": lambda mp: mp.setattr(S._Ops, "_read_audit_log", _read_unrecorded),
+    # Reads the log of every team.
+    "audit-cross-team-read": lambda mp: _sql_variant(mp, "_SQL_AUDIT_PAGE", "team_id = ?", "(team_id = ? OR 1 = 1)"),
+    # Takes a place of the write allowance even when none is left.
+    "audit-cap-unchecked": lambda mp: _sql_variant(mp, "_SQL_ALLOC_SEQ", "audit_writes < ?", "(audit_writes < ? OR 1 = 1)"),
+    # A read of the log takes a place of the write allowance (short of the reserve), not of its own.
+    "audit-reads-share-write-counter": lambda mp: mp.setattr(
+        S._Ops, "_alloc_read_seq", lambda self, q, team_id: self._alloc_seq(q, team_id, "read_audit_log")
+    ),
+    "pg-audit-cap-outside-lock": _audit_cap_outside_lock,
+    "refusal-quota-ignored": lambda mp: mp.setattr(S._Ops, "_refuse", _refuse_without_quota),
+    # Counts no teams, so MAX_TEAMS_TOTAL never stops a new team or a new personal team.
+    "server-cap-unchecked": lambda mp: _sql_variant(mp, "_SQL_COUNT_TEAMS", "SELECT COUNT(*) AS n", "SELECT 0 * COUNT(*) AS n"),
+    "sqlite-no-append-only-triggers": _sqlite_triggers_dropped("audit_events_no_update", "audit_events_no_delete"),
+    "pg-trigger-row-level-only": _pg_trigger_row_level_only,
+    # The app role may change and remove audit records.
+    "pg-app-granted-rewrite": lambda mp: mp.setattr(
+        schema, "_PG_GRANTS", (*schema._PG_GRANTS, "GRANT UPDATE, DELETE ON audit_events TO {app}")
+    ),
+    "pg-startup-check-skipped": lambda mp: mp.setattr(schema, "verify_app_role", lambda conn: None),
+    "daily-cap-unchecked": lambda mp: mp.setattr(S._Ops, "_daily_limit_reached", lambda self, c: False),
+    "daily-cap-blocks-reserve-tools": _reserve_tools_daily_capped,
+    # Every change counts on from yesterday's: the day's count never starts again.
+    "daily-cap-never-resets": lambda mp: _sql_variant(
+        mp, "_SQL_COUNT_WRITE", "CASE WHEN writes_day = ? THEN", "CASE WHEN (writes_day = ? OR 1 = 1) THEN"
+    ),
+    "invite-cap-unchecked": lambda mp: mp.setattr(S._Ops, "_create_invite", _create_invite(capped=False)),
+    "topic-index-restored": _topic_index_restored,
+    "pg-no-session-timeouts": lambda mp: mp.setattr(S.PostgresCardStore, "tx", _no_session_timeouts),
+    "pg-idle-timeout-unmapped": _idle_timeout_unmapped,
+    # --- Cut on 2026-10-30 to save time, restored in step 3. ---
+    "perm-rank-flat": lambda mp: mp.setitem(P.ROLE_RANK, "viewer", 2),
+    # Any member may use any tool: only membership is checked.
+    "perm-membership-only": lambda mp: mp.setattr(P, "allowed", lambda role, tool: role in P.ROLE_RANK),
+    "perm-invite-by-editor": _required(create_invite="editor"),
+    "perm-check-after-lookup": _existence_before_permission,
+    "reads-create-personal-team": _reads_create_personal_team,
+    "personal-team-shareable": lambda mp: mp.setattr(S._Ops, "_create_invite", _create_invite(personal_checked=False)),
+    "invite-errors-distinguishable": _expired_invite_distinguishable,
+    "invite-creator-not-rechecked": _invite_creator_not_rechecked,
+    "invite-consumed-on-already-member": _invite_consumed_on_already_member,
+    "sql-interpolated-team-id": lambda mp: mp.setattr(S._Ops, "_member", _member_with_team_id_in_text),
+    "denied-raised-in-transaction": _denied_raised_in_transaction,
+    "nonmember-audited": _nonmember_audited,
+    "audit-records-principal": _principal_as_client_id,
+    # The client's claim is stored as it came: any characters, any length.
+    "client-id-unsanitized": lambda mp: mp.setattr(identity, "clean_client_id", lambda raw: raw or ""),
+    "refused-error-logs-message": lambda mp: mp.setattr(S, "_refused", _refused_with_message),
+    "sqlite-replace-overwrites": _sqlite_triggers_dropped("audit_events_no_replace"),
+    "pg-app-owns-tables": _app_owns_tables,
+    "outage-ok-rewritten": _outage_ok_rewritten,
+    # Only table-wide UPDATE counts: a column-level grant on audit_events goes unseen.
+    "verify-table-privilege-only": lambda mp: _sql_variant(
+        mp, "_SQL_APP_ROLE", "has_any_column_privilege(g.oid, c.oid, 'UPDATE')",
+        "has_table_privilege(g.oid, c.oid, 'UPDATE')", module=schema,
+    ),
+    # Superuser, CREATEROLE, BYPASSRLS and neon_superuser are looked for on the app role
+    # only, never on the roles it belongs to.
+    "verify-ignores-inherited-roles": lambda mp: _sql_variant(
+        mp, "_SQL_APP_ROLE", "EXISTS (SELECT 1 FROM g WHERE (g.rolsuper",
+        "EXISTS (SELECT 1 FROM g WHERE g.rolname = current_user AND (g.rolsuper", module=schema,
+    ),
+    # --- The startup check's gaps found by the step 3 review (2026-11-07). ---
+    # Owning a schema, audit_events' own included, goes unseen (the database and what is in
+    # audit_events' schema still count).
+    "verify-ignores-owned-schemas": lambda mp: _sql_variant(
+        mp, "_SQL_APP_ROLE", "g.oid IN (SELECT nspowner FROM pg_namespace)", "false", module=schema
+    ),
+    # Owning the database goes unseen.
+    "verify-ignores-database-owner": lambda mp: _sql_variant(mp, "_SQL_APP_ROLE", "g.oid = d.datdba", "false", module=schema),
+    # Owning a table in the schema, audit_events itself included, goes unseen.
+    "verify-ignores-owned-tables": lambda mp: _sql_variant(
+        mp, "_SQL_APP_ROLE", "g.oid IN (SELECT r.relowner FROM pg_class r WHERE r.relnamespace = n.oid)", "false",
+        module=schema,
+    ),
+    # Owning a function in the schema, the one the triggers call included, goes unseen.
+    "verify-ignores-owned-functions": lambda mp: _sql_variant(
+        mp, "_SQL_APP_ROLE", "g.oid IN (SELECT f.proowner FROM pg_proc f WHERE f.pronamespace = n.oid)", "false",
+        module=schema,
+    ),
+    # The rights on audit_events are asked of the app role only (with what it inherits),
+    # never of the roles it may SET ROLE to.
+    "verify-inherited-privileges-only": lambda mp: _sql_variant(
+        mp, "_SQL_APP_ROLE", "EXISTS (SELECT 1 FROM g WHERE (has_any_column_privilege",
+        "EXISTS (SELECT 1 FROM g WHERE g.rolname = current_user AND (has_any_column_privilege", module=schema,
+    ),
+    # Only superusers count as powerful: CREATEROLE and BYPASSRLS go unseen.
+    "verify-ignores-role-attributes": lambda mp: _sql_variant(
+        mp, "_SQL_APP_ROLE", "(g.rolsuper OR g.rolcreaterole OR g.rolbypassrls OR g.rolname = 'neon_superuser')",
+        "(g.rolsuper OR g.rolname = 'neon_superuser')", module=schema,
+    ),
+    # Any function will do: one whose body lets every change through passes.
+    "verify-ignores-trigger-function": lambda mp: _sql_variant(
+        mp, "_SQL_TRIGGERS",
+        "p.prosrc = %s AND l.lanname = 'plpgsql' AND p.proconfig = ARRAY['search_path=pg_catalog'] AND NOT p.prosecdef",
+        "%s::text IS NOT NULL", module=schema,
+    ),
+    "triggers-not-always": _triggers_not_always,
+    "setup-db-accepts-reserved-role": lambda mp: mp.setattr(setup_db, "reserved_role", lambda name: False),
+    # The role is made without a password; the one shown was never set.
+    "create-app-role-without-password": lambda mp: mp.setattr(
+        setup_db, "_CREATE_ROLE", setup_db._CREATE_ROLE.replace("PASSWORD {password}", "PASSWORD NULL")
+    ),
+    "audit-page-off-by-one": _audit_page_off_by_one,
+    "daily-cap-before-permission": _daily_limit_before_permission,
+    "daily-cap-after-card-check": _card_checked_before_daily_limit,
+    # Each transaction keeps Postgres' default search path, "$user" first.
+    "pg-search-path-not-pinned": lambda mp: mp.setattr(S, "PG_SEARCH_PATH", '"$user", public'),
+    # --- The startup check's and setup's gaps found by the second step 3 review (2026-11-07). ---
+    # Only the triggers' names are compared: one that fires per row passes.
+    "verify-trigger-names-only": _trigger_names_only,
+    # Any function with the same body will do, whatever its search_path setting or rights.
+    "verify-function-body-only": lambda mp: _sql_variant(
+        mp, "_SQL_TRIGGERS",
+        "p.prosrc = %s AND l.lanname = 'plpgsql' AND p.proconfig = ARRAY['search_path=pg_catalog'] AND NOT p.prosecdef",
+        "p.prosrc = %s", module=schema,
+    ),
+    # A trigger setup never made, beside the two it did, goes unseen.
+    "verify-allows-extra-triggers": lambda mp: _sql_variant(
+        mp, "_SQL_AUDIT_EXTRAS",
+        "EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgrelid = c.oid AND NOT t.tgisinternal"
+        " AND t.tgname::text <> ALL (%s::text[]))",
+        "%s::text[] IS NULL", module=schema,
+    ),
+    "verify-ignores-rules-and-row-security": _rules_and_row_security_ignored,
+    # The roles that read and write the server's files or run programs on it go unseen.
+    "verify-ignores-file-roles": lambda mp: _sql_variant(
+        mp, "_SQL_APP_ROLE",
+        " OR g.rolname IN ('pg_read_server_files', 'pg_write_server_files', 'pg_execute_server_program')", "",
+        module=schema,
+    ),
+    # CREATE on the database or on a schema goes unseen (PUBLIC's still counts, on its own).
+    "verify-ignores-create": lambda mp: _sql_variant(
+        mp, "_SQL_APP_ROLE",
+        "has_database_privilege(g.oid, d.oid, 'CREATE')"
+        " OR EXISTS (SELECT 1 FROM pg_namespace s WHERE s.nspname !~ '^pg_(temp|toast_temp)_'::text"
+        " AND has_schema_privilege(g.oid, s.oid, 'CREATE'))",
+        "false", module=schema,
+    ),
+    # Belonging to any other role counts as too powerful, however harmless that role.
+    "verify-overbroad": lambda mp: _sql_variant(
+        mp, "_SQL_APP_ROLE", "EXISTS (SELECT 1 FROM g WHERE (g.rolsuper",
+        "EXISTS (SELECT 1 FROM g WHERE g.rolname <> current_user OR (g.rolsuper", module=schema,
+    ),
+    "setup-unpinned": _setup_unpinned,
+    "pg-read-search-path-not-pinned": lambda mp: mp.setattr(S.PostgresCardStore, "tx", _read_search_path_not_pinned),
+    # --- The startup check's and setup's gaps found by the third step 3 review (2026-11-07). ---
+    # Only the role the session is now counts: a login role whose default is to become the
+    # app role goes unseen, though it may RESET ROLE and act as any role it belongs to.
+    "verify-ignores-session-user": lambda mp: _sql_variant(
+        mp, "_SQL_APP_ROLE", "pg_has_role(session_user, oid, 'MEMBER') OR pg_has_role(current_user, oid, 'MEMBER')",
+        "pg_has_role(current_user, oid, 'MEMBER')", module=schema,
+    ),
+    # A SECURITY DEFINER function in public, of a role the session can't act as, goes unseen.
+    "verify-ignores-definer-functions": lambda mp: _sql_variant(
+        mp, "_SQL_APP_ROLE", "AND x.prosecdef", "AND false", module=schema
+    ),
+    # The session's own temporary schema counts as a place it may create in.
+    "verify-counts-temp-schemas": lambda mp: _sql_variant(
+        mp, "_SQL_APP_ROLE", "s.nspname !~ '^pg_(temp|toast_temp)_'::text AND ", "", module=schema
+    ),
+    # CREATE granted to PUBLIC is reported as a role too powerful, whose remedy (connect as
+    # another role) can't help.
+    "verify-public-create-as-too-powerful": lambda mp: _sql_variant(
+        mp, "_SQL_APP_ROLE",
+        "has_database_privilege('public', d.oid, 'CREATE') OR EXISTS (SELECT 1 FROM pg_namespace p"
+        " WHERE p.nspname !~ '^pg_(temp|toast_temp)_'::text AND has_schema_privilege('public', p.oid, 'CREATE'))",
+        "false", module=schema,
+    ),
+    # A parent or child table of audit_events, partitions included, goes unseen.
+    "verify-ignores-inheritance": lambda mp: _sql_variant(
+        mp, "_SQL_AUDIT_EXTRAS",
+        "(EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid OR i.inhparent = c.oid) OR c.relispartition)",
+        "false", module=schema,
+    ),
+    # Belonging to a role named neon_superuser goes unseen.
+    "verify-ignores-neon-superuser": lambda mp: _sql_variant(
+        mp, "_SQL_APP_ROLE", " OR g.rolname = 'neon_superuser'", "", module=schema
+    ),
+    # Setup goes ahead over tables and functions another role put in public, and over
+    # triggers it didn't make, firing them with the owner's rights (neither check runs).
+    "setup-adopts-foreign-objects": lambda mp: (
+        mp.setattr(schema, "_SQL_SETUP_FOREIGN", "SELECT false"), mp.setattr(schema, "_SQL_SETUP_RECHECK", "SELECT false")
+    ),
+    # Setup succeeds though every role may still create in the database.
+    "setup-ignores-public-create": lambda mp: mp.setattr(schema, "_SQL_SETUP_PUBLIC_CREATE", "SELECT false"),
+    # Setup keeps the session's path, "$user" first (its calls still name pg_catalog): the
+    # tables go into a schema named after the owner, and the rights are reset there.
+    "setup-search-path-not-pinned": lambda mp: _sql_variant(
+        mp, "_SQL_SETUP_PIN", "pg_catalog.set_config('search_path', 'public, pg_temp', true)", "NULL", module=schema
+    ),
+    # Run in the caller's transaction, setup leaves its own path behind.
+    "setup-keeps-its-search-path": lambda mp: _sql_variant(
+        mp, "_SQL_SETUP_RESTORE", "pg_catalog.set_config('search_path', %s, true)", "%s::text", module=schema
+    ),
+    # --- The startup check's and setup's gaps found by the fourth step 3 review (2026-11-07). ---
+    "setup-refuses-extensions": _setup_refuses_extensions,
+    # An extension's SECURITY DEFINER function counts as a way to act as its owner.
+    "verify-flags-extension-definers": lambda mp: _sql_variant(
+        mp, "_SQL_APP_ROLE",
+        " AND NOT EXISTS (SELECT 1 FROM pg_depend e JOIN pg_extension m ON m.tableoid = e.refclassid"
+        " AND m.oid = e.refobjid WHERE e.classid = x.tableoid AND e.objid = x.oid AND e.deptype = 'e')",
+        "", module=schema,
+    ),
+    # A trigger that calls another role's function, on one of the tables setup writes to,
+    # goes unseen.
+    "setup-ignores-foreign-triggers": lambda mp: _setup_foreign_variant(mp, _SETUP_TRIGGER_CHECK, ""),
+    # Setup checks only once, before it creates anything: what is planted after that check
+    # is fired by the INSERT.
+    "setup-no-recheck": lambda mp: mp.setattr(schema, "_SQL_SETUP_RECHECK", "SELECT false"),
+    # Setup doesn't lock its tables before the second check: a trigger can still be added.
+    "setup-unlocked": lambda mp: mp.setattr(schema, "_SQL_SETUP_LOCK_TABLES", "SELECT 1"),
+    # The advisory lock call names no schema and passes the lock id as psycopg sends it
+    # (integer); the path is still pinned.
+    "setup-lock-unqualified": lambda mp: _sql_variant(
+        mp, "_SQL_SETUP_LOCK", "pg_catalog.pg_advisory_xact_lock(%s::bigint)", "pg_advisory_xact_lock(%s)", module=schema
+    ),
+    "setup-ignores-foreign-relations": _setup_ignores_foreign_relations,
+    # A session that made a temporary table can't set up: its own temporary schema counts
+    # as one PUBLIC may create in.
+    "setup-counts-temp-schemas": lambda mp: _sql_variant(
+        mp, "_SQL_SETUP_PUBLIC_CREATE", "s.nspname !~ '^pg_(temp|toast_temp)_'::text AND ", "", module=schema
+    ),
+    # The same in the startup check's PUBLIC column: a session that made a temporary table
+    # is told every role may create.
+    "verify-public-create-counts-temp-schemas": lambda mp: _sql_variant(
+        mp, "_SQL_APP_ROLE", "p.nspname !~ '^pg_(temp|toast_temp)_'::text AND ", "", module=schema
+    ),
+    "setup-leaves-app-create": _setup_leaves_app_create,
+    # Each transaction searches the session's temporary schema first (pg_temp unlisted).
+    "pg-temp-tables-searched-first": lambda mp: mp.setattr(S, "PG_SEARCH_PATH", "public"),
+    # --- Setup's and the startup check's gaps found verifying the fourth review (2026-11-07). ---
+    # Setup counts composite types and indexes as relations another role owns: an
+    # extension's composite type (tablefunc's) or its table's primary key index isn't an
+    # extension member itself, so every database with one is refused.
+    "setup-counts-types-and-indexes": lambda mp: _setup_foreign_variant(mp, _SETUP_RELKIND_SKIP, ""),
+    # Only an extension's relations count as another role's: its functions still pass.
+    "setup-refuses-extension-relations": lambda mp: _setup_foreign_variant(mp, _setup_extension_exemption("r"), ""),
+    "setup-refuses-owners-triggers": _setup_refuses_owners_triggers,
+    # The startup check's path without pg_temp, which is then searched first: a temporary
+    # pg_roles or schema_info stands in for the real one.
+    "verify-temp-searched-first": lambda mp: mp.setattr(schema, "_CHECK_SEARCH_PATH", "pg_catalog, public"),
+    # The same in setup's pin: a temporary audit_events in the owner's session gets the
+    # triggers and the rights instead of public's.
+    "setup-temp-searched-first": lambda mp: _sql_variant(mp, "_SQL_SETUP_PIN", "'public, pg_temp'", "'public'", module=schema),
 }

@@ -47,3 +47,5 @@ AUDIT_ACTION = {
 # Tools whose successful calls may use the last part of a team's audit allowance
 # (limits.AUDIT_OWNER_RESERVE). read_audit_log has an allowance of its own.
 RESERVE_TOOLS = frozenset({"set_member_role", "remove_member", "leave_team"})
+# Tools whose successful calls count toward limits.MAX_WRITES_PER_MEMBER_PER_DAY.
+DAILY_CAPPED_TOOLS = frozenset({"add_card", "grade_card", "delete_card", "create_invite"})

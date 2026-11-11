@@ -143,6 +143,12 @@ def test_the_documented_limits():
     # The numbers the README gives. The tests above lower a limit to reach it quickly;
     # this keeps the README and the code in step.
     assert (limits.MAX_CARDS_PER_TEAM, limits.MAX_CHARS_PER_TEAM) == (1000, 200_000)
-    assert (limits.MAX_MEMBERS_PER_TEAM, limits.MAX_SHARED_TEAMS_PER_PERSON) == (25, 10)
+    assert (limits.MAX_MEMBERS_PER_TEAM, limits.MAX_SHARED_TEAMS_PER_PERSON) == (25, 2)
+    assert limits.MAX_WRITES_PER_MEMBER_PER_DAY == 500
+    assert limits.MAX_INVITES_PER_TEAM == 1_000
     assert limits.INVITE_TTL_SECONDS == 72 * 3600
     assert limits.MAX_REFUSALS_LOGGED_PER_MEMBER == 100
+    assert (
+        limits.AUDIT_CAP_PER_TEAM, limits.AUDIT_OWNER_RESERVE, limits.AUDIT_READS_CAP_PER_TEAM,
+        limits.MAX_TEAMS_TOTAL, limits.MAX_CLIENT_ID,
+    ) == (100_000, 200, 2_000, 12, 64)

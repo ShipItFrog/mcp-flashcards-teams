@@ -44,7 +44,9 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .server import create_server
-from .store import CardStore, PostgresCardStore, SqliteCardStore, StoreUnavailableError
+from .store import (
+    AppRoleTooPowerfulError, CardStore, PostgresCardStore, SchemaNotReadyError, SqliteCardStore, StoreUnavailableError,
+)
 from .verifier import USER_AGENT, JwtTokenVerifier
 
 logger = logging.getLogger(__name__)
@@ -421,7 +423,8 @@ class McpEndpointGuard:
 def open_store(settings: Settings) -> CardStore:
     """Open the configured database and say which one. A SQLite file gets its tables
     created if needed; a Postgres database must already have them (the server never
-    creates tables there: see schema.setup_database)."""
+    creates tables there: see schema.setup_database), and the server won't start unless
+    they are set up and its role can't change or remove audit records."""
     if settings.database_url is not None:
         label = database_label(settings.database_url)
         logger.info("Connecting to the Postgres database %s", label)
@@ -432,7 +435,9 @@ def open_store(settings: Settings) -> CardStore:
                 f"Could not reach the Postgres database {label} at startup. "
                 "Check FLASHCARDS_DATABASE_URL (value not shown) and that the database is running."
             ) from None
-        logger.info("Connected to the Postgres database %s", label)
+        except (SchemaNotReadyError, AppRoleTooPowerfulError) as e:
+            raise ConfigError(str(e)) from None  # a fixed message: no URL, host or role
+        logger.info("Database schema checked: the Postgres database %s", label)
         return store
     assert settings.db_path is not None
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)

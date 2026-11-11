@@ -1,5 +1,5 @@
 """Every team tool, called by every kind of person, over every transport, on both
-databases: the reply and exactly what changed in the data.
+databases: the reply, exactly what changed in the data, and the audit records it added.
 
 The expected results are written out here rather than taken from the server, so a
 change to the rules must change this table too. In the fixture (helpers.team_fixture)
@@ -7,11 +7,14 @@ dave is the only owner, erin an editor, frank a viewer, bob owns another team an
 stranger here, and gina was a member and has been removed.
 """
 
+import logging
+
 import pytest
 from helpers import (
-    ISSUER, TRANSPORTS, mcp_client, payload, refusal, running_app, snapshot, team_fixture, without_audit,
+    ISSUER, TRANSPORTS, audit_rows, mcp_client, payload, refusal, running_app, snapshot, team_fixture, without_audit,
 )
 
+from flashcards_teams import limits
 from flashcards_teams.server import M_ALREADY, M_DENIED, M_LAST_OWNER, M_NO_TEAM
 
 pytestmark = pytest.mark.anyio
@@ -33,6 +36,12 @@ NEEDS = {
     "list_cards": "viewer", "review": "viewer", "leave_team": "viewer",
     "add_card": "editor", "grade_card": "editor", "delete_card": "editor",
     "create_invite": "owner", "set_member_role": "owner", "remove_member": "owner", "read_audit_log": "owner",
+}
+# The action each tool's audit record names.
+ACTIONS = {
+    "add_card": "card.add", "grade_card": "card.grade", "delete_card": "card.delete", "create_invite": "invite.create",
+    "set_member_role": "member.role", "remove_member": "member.remove", "read_audit_log": "audit.read",
+    "leave_team": "member.leave",
 }
 
 
@@ -84,17 +93,40 @@ def after_success(tool: str, before: dict, f, caller: str) -> dict:
     return after
 
 
+def records_added(tool: str, expected: str, member_no: int | None) -> list[tuple]:
+    """The audit records a cell adds to the team, as (member_no, action, result, reason)."""
+    if expected == "no_team" or tool in ("list_cards", "review"):
+        return []  # a stranger's attempt has no team to be recorded in; reading cards isn't recorded
+    result, reason = {"ok": ("ok", ""), "denied": ("denied", "role"), "last_owner": ("failed", "last_owner")}[expected]
+    return [(member_no, ACTIONS[tool], result, reason)]
+
+
 @pytest.mark.parametrize("transport", TRANSPORTS)
 @pytest.mark.parametrize("identity", list(IDENTITIES))
 @pytest.mark.parametrize("tool", list(EXPECTED))
-async def test_matrix(store, tool, identity, transport):
+async def test_matrix(store, tool, identity, transport, caplog):
     mode, stateless = transport
     name = IDENTITIES[identity]
     f = await team_fixture(store)
     before = snapshot(store)
-    async with running_app(store, stateless=stateless) as app, mcp_client(app, f"{name}-1", mode) as client:
-        result = await client.call_tool(tool, arguments(tool, f))
+    records = audit_rows(store, f.team)
+    with caplog.at_level(logging.INFO, logger="flashcards_teams.server"):
+        async with running_app(store, stateless=stateless) as app, mcp_client(app, f"{name}-1", mode) as client:
+            result = await client.call_tool(tool, arguments(tool, f))
     expected = EXPECTED[tool][identity]
+    # The audit records: exactly what the cell adds to the team, and nothing to any other.
+    added = audit_rows(store, f.team)[len(records):]
+    assert [(r["member_no"], r["action"], r["result"], r["reason"]) for r in added] == records_added(
+        tool, expected, f.numbers.get(name)
+    )
+    after = snapshot(store)
+    assert {t: n for t, n in after["audit"].items() if t != f.team} == {
+        t: n for t, n in before["audit"].items() if t != f.team
+    }
+    if expected == "no_team":
+        assert [r.getMessage() for r in caplog.records if r.name == "flashcards_teams.server"] == [
+            f"Refused {tool}: caller is not a member of the requested team"
+        ]
     if expected == "ok":
         assert payload(result)["ok"] is True
         change = after_success(tool, before, f, name)
@@ -106,12 +138,14 @@ async def test_matrix(store, tool, identity, transport):
         }[expected]
         assert refusal(result) == message
         change = without_audit(before)
-    assert without_audit(snapshot(store)) == change
+    assert without_audit(after) == change
 
 
 @pytest.mark.parametrize("identity", list(IDENTITIES))
-async def test_team_free_tools(store, identity):
+async def test_team_free_tools(store, identity, monkeypatch):
     # create_team, list_teams and join_team belong to no team: anyone signed in may call them.
+    # bob ends up in three shared teams (his own, the new one, team A): above the real limit.
+    monkeypatch.setattr(limits, "MAX_SHARED_TEAMS_PER_PERSON", 3)
     name = IDENTITIES[identity]
     f = await team_fixture(store)
     async with running_app(store) as app, mcp_client(app, f"{name}-1", "auto") as client:

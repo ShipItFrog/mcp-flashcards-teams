@@ -12,12 +12,14 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from helpers import (
-    actor, fresh_postgres_store, mcp_client, payload, queued_behind, raw, refusal, rows, running_app, snapshot,
-    team_fixture,
+    actor, audit_rows, fresh_postgres_store, mcp_client, payload, queued_behind, raw, refusal, rows, running_app,
+    snapshot, team_fixture, without_audit,
 )
 
 from flashcards_teams import ids, limits
-from flashcards_teams.server import M_ALREADY, M_INVITE, M_PERSONAL, M_TEAM_FULL, M_TOO_MANY_TEAMS
+from flashcards_teams.server import (
+    M_ALREADY, M_INVITE, M_INVITES_USED_UP, M_PERSONAL, M_TEAM_FULL, M_TOO_MANY_TEAMS,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -169,6 +171,31 @@ async def test_a_personal_team_cant_have_invites(store):
         for role in ("editor", "viewer"):
             assert refusal(await erin.call_tool("create_invite", {"team_id": personal["team_id"], "role": role})) == M_PERSONAL
     assert rows(store, "invites") == 0
+
+
+async def test_a_team_can_create_only_so_many_invites(store, monkeypatch):
+    # For its whole life, so the invites table, never emptied, stays small.
+    monkeypatch.setattr(limits, "MAX_INVITES_PER_TEAM", 3)
+    async with running_app(store) as app, mcp_client(app, "dave-1", "auto") as dave:
+        team = payload(await dave.call_tool("create_team", {"name": "Few invites"}))["team_id"]
+        for n in (1, 2, 3):  # the third is still allowed
+            assert payload(await dave.call_tool("create_invite", {"team_id": team, "role": "viewer"}))["invite_no"] == n
+        before, records = snapshot(store), audit_rows(store, team)
+        assert refusal(await dave.call_tool("create_invite", {"team_id": team, "role": "editor"})) == (
+            M_INVITES_USED_UP.format(n=3)
+        )
+        # No invite, but the failure is recorded.
+        assert without_audit(snapshot(store)) == without_audit(before)
+        added = audit_rows(store, team)[len(records):]
+        assert [(r["action"], r["target"], r["result"], r["reason"]) for r in added] == [
+            ("invite.create", "team", "failed", "invites_used_up")
+        ]
+        # A personal team is refused for being one, whatever its count.
+        monkeypatch.setattr(limits, "MAX_INVITES_PER_TEAM", 0)
+        payload(await dave.call_tool("add_card", {"question": "q?", "answer": "a", "topic": "t"}))
+        [personal] = [t for t in payload(await dave.call_tool("list_teams", {}))["teams"] if t["personal"]]
+        assert refusal(await dave.call_tool("create_invite", {"team_id": personal["team_id"], "role": "viewer"})) == M_PERSONAL
+    assert rows(store, "invites") == 3
 
 
 @pytest.fixture
